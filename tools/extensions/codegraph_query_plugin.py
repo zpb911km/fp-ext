@@ -6,6 +6,15 @@ CodeGraph 查询插件 — 基于 AST 的按需代码结构分析
 泛用性：通过 `project_path` 参数指定任意项目目录，不局限于本 Agent。
 """
 
+__fp__ = {
+    "name": "codegraph",
+    "version": "1.0.0",
+    "description": "基于 AST 的按需代码结构分析（跨文件依赖/调用关系）",
+    "author": "zpb",
+    "license": "MIT",
+    "type": "tools",
+}
+
 import ast
 import os
 import re
@@ -63,7 +72,7 @@ python ONLY!
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "要分析的项目根目录（必填），如 /home/user/projects/myapp",
+                    "description": "要分析的项目根目录（必填），如 /path/to/project",
                 },
                 "file": {
                     "type": "string",
@@ -1118,7 +1127,7 @@ async def execute(params: dict[str, Any]) -> str:
     project_path = params.get("project_path", "")
 
     if not project_path:
-        return "⚠️ 缺少必填参数 `project_path`，请指定要分析的项目根目录，如 project_path=/home/user/projects/myapp"
+        return "⚠️ 缺少必填参数 `project_path`，请指定要分析的项目根目录，如 project_path=/path/to/project"
 
     # 解析项目根目录
     root = Path(project_path).resolve()
