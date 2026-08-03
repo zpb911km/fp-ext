@@ -10,6 +10,10 @@
     "tools/ask_llm": {
       "source": "ask_llm",
       "updated_at": "2026-08-04T02:45:14"
+    },
+    "tools/vision": {
+      "source": "vision",
+      "updated_at": "2026-08-04T02:45:15"
     }
   }
 }
