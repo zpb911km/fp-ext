@@ -2,10 +2,5 @@
   "schema": 1,
   "author": "zpb",
   "license": "MIT",
-  "assets": {
-    "tools/codegraph": {
-      "source": "codegraph",
-      "updated_at": "2026-08-04T00:45:40"
-    }
-  }
+  "assets": {}
 }
