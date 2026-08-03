@@ -6,6 +6,10 @@
     "tools/codegraph": {
       "source": "codegraph",
       "updated_at": "2026-08-04T00:45:40"
+    },
+    "tools/ask_llm": {
+      "source": "ask_llm",
+      "updated_at": "2026-08-04T02:45:14"
     }
   }
 }
