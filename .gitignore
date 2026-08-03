@@ -1,0 +1,6 @@
+# Python 运行时副产物（FP 加载插件时生成）
+__pycache__/
+*.pyc
+
+# FP 回收站
+.trash/
