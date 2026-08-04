@@ -23,7 +23,7 @@ __fp__ = {
     "version": "1.0.0",
     "description": "Qwen 视觉图像识别",
     "author": "zpb",
-    "license": "MIT",
+    "license": "GPL-3.0",
     "type": "tools",
 }
 

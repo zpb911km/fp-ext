@@ -21,7 +21,7 @@ __fp__ = {
     "version": "1.0.0",
     "description": "AI 联网搜索与总结（Qwen 联网）",
     "author": "zpb",
-    "license": "MIT",
+    "license": "GPL-3.0",
     "type": "tools",
 }
 

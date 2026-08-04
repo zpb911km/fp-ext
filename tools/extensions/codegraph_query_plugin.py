@@ -11,7 +11,7 @@ __fp__ = {
     "version": "1.0.0",
     "description": "基于 AST 的按需代码结构分析（跨文件依赖/调用关系）",
     "author": "zpb",
-    "license": "MIT",
+    "license": "GPL-3.0",
     "type": "tools",
 }
 
