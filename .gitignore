@@ -4,3 +4,6 @@ __pycache__/
 
 # FP 回收站
 .trash/
+
+# FP 本地停用文件（分享走 git 登记启用版，本地停用不入库）
+*.disabled
