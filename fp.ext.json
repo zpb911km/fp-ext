@@ -18,6 +18,10 @@
     "plugins/tool_audit": {
       "source": "tool_audit",
       "updated_at": "2026-08-04T14:53:26"
+    },
+    "commands/model": {
+      "source": "model",
+      "updated_at": "2026-09-03T20:43:16"
     }
   }
 }
