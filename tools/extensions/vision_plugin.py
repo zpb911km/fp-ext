@@ -1,323 +1,134 @@
 """
-Qwen Vision 插件 — 图像识别
-=============================
-上传图像到 Qwen OSS，通过视觉模型识别，返回文本描述。
+Vision —— 让网页版 AI 看图
+================================================
 
-依赖：
-    pip install oss2 requests
+多后端：上传与理解的差异全在 public/webai/，本插件只做参数校验与结果整形。
 
-Cookie 配置（任选其一）：
-    1. 环境变量 QWEN_COOKIE="cna=xxx; aui=xxx; token=xxx; ..."
-    2. 文件 ~/.qwen_cookie：echo 'cna=xxx; aui=xxx; token=xxx; ...' > ~/.qwen_cookie
+    qwen      OSS STS 上传，把文件挂到 message.files
+    deepseek  POST /api/v0/file/upload_file（需 PoW），file_id 放进 ref_file_ids
 
-用法（由 Agent 自动调用）：
-    vision(image_path="/path/to/image.png", query="描述这张图片")
-
-实现说明：
-    - 纯 requests + oss2 实现，无需 Playwright / 浏览器
-    - 参考 smart_web_search_plugin.py 的流式 SSE 解析模式
+两者都实测支持**真正的图像理解**（不只是 OCR）：
+给一张零文字的几何图，能正确答出"3 个红色圆形 + 1 个蓝色正方形"。
 """
 
 __fp__ = {
     "name": "vision",
-    "version": "1.0.0",
-    "description": "Qwen 视觉图像识别",
+    "version": "2.0.0",
+    "description": "图像理解（上传图片给网页版AI识别，多后端）",
     "author": "zpb",
     "license": "GPL-3.0",
     "type": "tools",
 }
 
-
-
 import asyncio
-import json
-import mimetypes
+import importlib.util
 import os
-import time
-import uuid
+import sys
+from pathlib import Path
 from typing import Any
 
-import oss2
-import requests
-
-# ── 常量 ───────────────────────────────────────────────────────────
-
-API_BASE = "https://chat.qwen.ai"
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-
-_DEFAULT_COOKIE = os.environ.get("QWEN_COOKIE", "")
-_COOKIE_FILE = os.path.expanduser("~/.qwen_cookie")
+_IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 
 
-# ── Cookie ─────────────────────────────────────────────────────────
-
-
-def _load_cookie() -> str:
-    """从环境变量或 ~/.qwen_cookie 读取 cookie"""
-    cookie = os.environ.get("QWEN_COOKIE", "")
-    if cookie:
-        return cookie
+def load_webai():
+    """把 public/webai 包按路径加载进来（插件加载器不往 sys.path 加目录）"""
+    if "webai" in sys.modules:
+        return sys.modules["webai"]
     try:
-        with open(_COOKIE_FILE) as f:
-            cookie = f.read().strip()
-            if cookie:
-                return cookie
-    except (FileNotFoundError, PermissionError):
-        pass
-    return ""
+        from fp_core.platform_utils import get_data_dir
 
-
-# ── 请求头 ─────────────────────────────────────────────────────────
-
-
-def _make_headers() -> dict:
-    return {
-        "User-Agent": USER_AGENT,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Origin": API_BASE,
-        "Referer": f"{API_BASE}/",
-        "Version": "0.2.63",
-        "source": "web",
-        "X-Request-Id": str(uuid.uuid4()),
-        "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT+0800"),
-    }
-
-
-# ── 文件上传（OSS）────────────────────────────────────────────────
-
-
-def _get_sts_token(sess: requests.Session, filename: str, filesize: int, filetype: str) -> dict:
-    """获取 OSS STS 凭证 + file_id/file_url"""
-    r = sess.post(
-        f"{API_BASE}/api/v1/files/getstsToken",
-        headers=_make_headers(),
-        json={"filename": filename, "filesize": str(filesize), "filetype": filetype},
-        timeout=15,
+        data = str(get_data_dir())
+    except Exception:
+        data = os.path.expanduser("~/.local/share/fp")
+    pkg = Path(data) / "public" / "webai"
+    if not (pkg / "__init__.py").exists():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "webai", pkg / "__init__.py", submodule_search_locations=[str(pkg)]
     )
-    r.raise_for_status()
-    return r.json()
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["webai"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _upload_file(cookie_str: str, file_path: str) -> dict:
-    """
-    上传文件到 Qwen OSS，返回文件元数据。
-
-    纯 requests + oss2 实现，无需浏览器。
-    """
-    with open(file_path, "rb") as f:
-        data = f.read()
-    filename = os.path.basename(file_path)
-    filetype, _ = mimetypes.guess_type(filename)
-    filetype = filetype or "application/octet-stream"
-
-    ft = filetype.split("/")[0] if "/" in filetype else "file"
-    file_class = {"image": "vision", "video": "video", "audio": "audio"}.get(ft, "file")
-    file_show_type = {"image": "image", "video": "video", "audio": "audio"}.get(ft, "file")
-
-    sess = requests.Session()
-    for item in cookie_str.split("; "):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            sess.cookies.set(k, v)
-
-    sts = _get_sts_token(sess, filename, len(data), filetype)
-
-    auth = oss2.StsAuth(
-        sts["access_key_id"],
-        sts["access_key_secret"],
-        sts["security_token"],
-    )
-    bucket = oss2.Bucket(
-        auth,
-        f"https://{sts['endpoint']}",
-        sts["bucketname"],
-    )
-    result = bucket.put_object(sts["file_path"], data)
-    if result.status != 200:
-        raise OSError(f"OSS 上传失败: HTTP {result.status}")
-
-    return {
-        "id": sts["file_id"],
-        "name": filename,
-        "file_type": filetype,
-        "type": file_show_type,
-        "file_class": file_class,
-        "size": len(data),
-        "url": sts["file_url"],
-        "file": {
-            "id": sts["file_id"],
-            "filename": filename,
-            "size": len(data),
-            "type": filetype,
-            "meta": {"name": filename, "size": len(data), "content_type": filetype},
-        },
-    }
+_webai = load_webai()
 
 
-# ── SSE 解析 ──────────────────────────────────────────────────────
-
-
-def _extract_text_from_sse(sse_text: str) -> str:
-    """从 SSE 原始文本中提取最终回答内容"""
-    parts = []
-    for line in sse_text.split("\n"):
-        if not line.startswith("data: "):
-            continue
-        ds = line[6:].strip()
-        if ds == "[DONE]" or '"response.created"' in ds:
-            continue
+def _vision_providers() -> list:
+    """只列出声明了 vision 能力的后端"""
+    if not _webai:
+        return ["qwen"]
+    out = []
+    for n in _webai.names():
         try:
-            data = json.loads(ds)
-            for choice in data.get("choices", []):
-                delta = choice.get("delta", {})
-                if delta.get("phase") == "answer":
-                    c = delta.get("content", "")
-                    if c:
-                        parts.append(c)
-        except (json.JSONDecodeError, KeyError):
+            if "vision" in getattr(_webai.get(n), "capabilities", set()):
+                out.append(n)
+        except Exception:  # noqa: BLE001
             continue
-    return "".join(parts)
+    return out or ["qwen"]
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 核心函数（同步，纯 requests）
-# ═══════════════════════════════════════════════════════════════════
-
-
-def vision(image_path: str, query: str = "描述这张图片", model: str = "qwen3.7-plus", cookie: str = "") -> str:
-    """
-    同步函数：上传图像 → Qwen 视觉识别 → 返回文本描述。
-
-    纯 requests + oss2 实现，无需 Playwright / 浏览器。
-    参考 smart_web_search 的流式 SSE 写法。
+def vision(
+    image_path: str,
+    query: str = "描述这张图片",
+    provider: str = "qwen",
+    think: bool = False,
+) -> str:
+    """上传图片并提问，返回文本回答。
 
     参数：
-        image_path:  图像文件路径
-        query:       询问文本，默认"描述这张图片"
-        model:       模型名，默认 qwen3.7-plus
-        cookie:      cookie 字符串（可选，默认从环境变量 QWEN_COOKIE
-                     或 ~/.qwen_cookie 读取）
-
-    返回：
-        str: Qwen 的文本回复
+        image_path: 图像文件路径
+        query:      询问文本
+        provider:   后端（默认 qwen）
+        think:      深度思考模式（默认关闭；关闭时更快）
     """
-    cookie = cookie or _load_cookie()
-    if not cookie:
-        return "错误：未找到 Qwen cookie。请将 cookie 写入 ~/.qwen_cookie 文件，或设置环境变量 QWEN_COOKIE"
+    if not _webai:
+        return "错误：webai 包缺失（<数据目录>/public/webai/）"
+
+    name = (provider or "qwen").lower()
+    try:
+        p = _webai.get(name)
+    except Exception as e:  # noqa: BLE001
+        return f"错误：未知 provider「{name}」：{e}"
+
+    if "vision" not in getattr(p, "capabilities", set()):
+        return f"错误：provider「{name}」不支持 vision 能力"
+
+    ok, why = p.available()
+    if not ok:
+        return f"错误：{why}"
 
     if not os.path.isfile(image_path):
         return f"错误：文件不存在 - {image_path}"
+    if not image_path.lower().endswith(_IMG_EXT):
+        return f"错误：不支持的图片格式 - {image_path}"
 
-    if not image_path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
-        return f"错误：不支持的文件格式 - {image_path}"
-
-    # ── 1. 上传文件到 OSS ──
     try:
-        file_info = _upload_file(cookie, image_path)
-    except Exception as e:
+        ref = p.upload(image_path)
+    except Exception as e:  # noqa: BLE001
         return f"文件上传失败: {e}"
 
-    # ── 2. 创建 session ──
-    sess = requests.Session()
-    for item in cookie.split("; "):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            sess.cookies.set(k, v)
-
-    # ── 3. 创建聊天会话 ──
     try:
-        r = sess.post(
-            f"{API_BASE}/api/v2/chats/new",
-            headers=_make_headers(),
-            json={"model": model},
-            timeout=15,
-        )
-        r.raise_for_status()
-        chat_id = r.json()["data"]["id"]
-    except Exception as e:
-        return f"创建会话失败: {e}"
+        sid = p.new_session()
+        r = p.ask(sid, query, files=[ref], think=think)
+    except Exception as e:  # noqa: BLE001
+        return f"识别失败: {e}"
 
-    # ── 4. 构建消息 ──
-    fid = str(uuid.uuid4())
-    cid = str(uuid.uuid4())
-    user_msg = {
-        "fid": fid,
-        "parentId": None,
-        "childrenIds": [cid],
-        "role": "user",
-        "content": query,
-        "user_action": "chat",
-        "files": [file_info],
-        "timestamp": int(time.time()),
-        "models": [model],
-        "chat_type": "t2t",
-        "feature_config": {
-            "thinking_enabled": True,
-            "output_schema": "phase",
-            "research_mode": "normal",
-            "auto_thinking": True,
-            "thinking_mode": "Auto",
-            "thinking_format": "summary",
-            "auto_search": True,
-        },
-        "extra": {"meta": {"subChatType": "t2t"}},
-        "sub_chat_type": "t2t",
-    }
-
-    body = {
-        "stream": True,
-        "version": "2.1",
-        "incremental_output": True,
-        "chat_id": chat_id,
-        "chat_mode": "normal",
-        "model": model,
-        "parent_id": None,
-        "messages": [user_msg],
-        "timestamp": int(time.time()),
-    }
-
-    # ── 5. 流式请求，逐行读取 SSE ──
-    #     与 smart_web_search_plugin.py 完全一致的 pattern
-    try:
-        r2 = sess.post(
-            f"{API_BASE}/api/v2/chat/completions?chat_id={chat_id}",
-            headers={
-                **_make_headers(),
-                "Accept": "application/json, text/event-stream",
-                "X-Accel-Buffering": "no",
-            },
-            json=body,
-            stream=True,
-            timeout=120,
-        )
-        r2.raise_for_status()
-
-        sse_text = ""
-        for line in r2.iter_lines(decode_unicode=True):
-            if line is None:
-                continue
-            sse_text += line + "\n"
-            if line.strip() == "data: [DONE]":
-                break
-
-    except Exception as e:
-        return f"API 请求失败: {e}"
-
-    # ── 6. 解析 SSE ──
-    reply = _extract_text_from_sse(sse_text)
-    return reply or "(识别无返回)"
+    text = (r.get("text") or "").strip()
+    return text or "(识别无返回)"
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 插件定义
-# ═══════════════════════════════════════════════════════════════════
+# ── 插件定义 ────────────────────────────────────────────────────
 
 PLUGIN_DEFINITION = {
     "type": "function",
     "function": {
         "name": "vision",
-        "description": "将图像上传到视觉模型识别，返回文字描述。支持截图/照片/图表。",
+        "description": (
+            "将图像上传到网页版AI模型识别，返回文字描述或回答关于图像的问题。"
+            "支持截图/照片/图表。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -328,7 +139,11 @@ PLUGIN_DEFINITION = {
                 "query": {
                     "type": "string",
                     "description": "对图像的询问文本，如: 描述这张图片 / 这张图表显示什么趋势",
-                    "default": "描述这张图片",
+                },
+                "provider": {
+                    "type": "string",
+                    "enum": _vision_providers(),
+                    "description": "用哪个后端，默认 qwen。不同厂商识别能力有差异，可换着试",
                 },
             },
             "required": ["image_path"],
@@ -337,28 +152,14 @@ PLUGIN_DEFINITION = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 执行器（异步适配器，供插件系统调用）
-# ═══════════════════════════════════════════════════════════════════
-
+# ── 执行器 ──────────────────────────────────────────────────────
 
 async def execute(params: dict[str, Any]) -> str:
-    """
-    执行图像识别（异步适配器）
-
-    Args:
-        params: {"image_path": "...", "query": "..."}
-
-    Returns:
-        识别结果文本
-    """
-    image_path = params.get("image_path", "")
-    query = params.get("query", "描述这张图片")
-
+    image_path = (params.get("image_path") or "").strip()
     if not image_path:
         return "错误：需要 image_path 参数"
+    query = (params.get("query") or "描述这张图片").strip()
+    provider = (params.get("provider") or "qwen").strip()
 
-    # vision 是同步函数，在线程池中运行以避免阻塞事件循环
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, vision, image_path, query)
-    return result
+    return await loop.run_in_executor(None, vision, image_path, query, provider)
