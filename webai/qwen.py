@@ -236,6 +236,13 @@ def ask(
     files: list | None = None,
 ) -> dict:
     model = model or default_model
+
+    # ⚠️ 实测：Qwen 只在思考模式下才真正触发联网搜索。
+    #    think=False + auto_search=True 会被无视，模型直接回"我无法访问实时信息"，
+    #    且返回 0 条引用 —— 静默失效，很难察觉。所以开搜索时强制打开思考。
+    if search:
+        think = True
+
     msg = {
         "fid": str(uuid.uuid4()),
         "parentId": parent_message_id,
