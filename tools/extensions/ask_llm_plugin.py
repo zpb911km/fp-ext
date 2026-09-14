@@ -41,7 +41,10 @@ import requests
 # ── 路径 ──────────────────────────────────────────────────────
 
 API_BASE = "https://chat.qwen.ai"
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
 
 
 # ── Cookie 读取 ────────────────────────────────────────────────
@@ -165,16 +168,21 @@ def _parse_sse(sse_text: str) -> dict:
 
 
 def _make_headers() -> dict:
+    """完整浏览器头 —— 缺项会被阿里云 WAF 拦成 HTML 挑战页"""
     return {
         "User-Agent": USER_AGENT,
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": "application/json, text/plain, */*",
         "Origin": API_BASE,
         "Referer": f"{API_BASE}/",
         "Version": "0.2.63",
         "source": "web",
         "X-Request-Id": str(uuid.uuid4()),
         "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT+0800"),
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "sec-ch-ua": '"Chromium";v="140", "Not(A:Brand";v="24"',
+        "sec-ch-ua-platform": '"Linux"',
+        "sec-fetch-site": "same-origin",
     }
 
 
@@ -289,6 +297,14 @@ def ask_llm(keywords: str, cookie: str = "") -> dict:
             sse_text += line + "\n"
             if line.strip() == "data: [DONE]":
                 break
+
+        # 检测 WAF 拦截（阿里云 WAF 会返回 HTML 挑战页而非 SSE 流）
+        head = sse_text[:2000].lower()
+        if "<html" in head or "aliyun" in head or "captcha" in head:
+            return error_result(
+                "Qwen 返回 HTML 挑战页（疑似被 WAF 拦截或 cookie 失效）。"
+                "请重试，或更新 ~/.qwen_cookie"
+            )
 
         # 检测 API 返回的错误（非 SSE 格式的错误响应）
         first_line = sse_text.split("\n")[0] if sse_text else ""
