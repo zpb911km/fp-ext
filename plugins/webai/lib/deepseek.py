@@ -84,7 +84,7 @@ def load_token() -> str:
 def available():
     if not load_token():
         return False, ("未找到有效 DeepSeek token。请运行登录脚本重新登录：\n"
-                       "    python3 <fp数据目录>/public/webai/deepseek_login.py")
+                       "    python3 <fp数据目录>/public/plugins/webai/lib/deepseek_login.py")
     try:
         import wasmtime  # noqa: F401
     except ImportError:

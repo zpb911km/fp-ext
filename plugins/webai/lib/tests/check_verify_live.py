@@ -14,7 +14,7 @@ AUTH 自愈永不触发。换成 `new_session()` 探针后才正常。
 
 用法（会短暂替换凭据文件，全程 try/finally 保证还原）::
 
-    cd <data>/public/webai && python3 tests/check_verify_live.py --yes
+    cd <data>/public/plugins/webai/lib && python3 tests/check_verify_live.py --yes
 
 ⚠️ 需要联网；会带"垃圾凭据"发一次请求（等价于 cookie 自然过期时的情形）。
 ⚠️ 全程只改凭据文件、不改别的；异常/中断也会还原。

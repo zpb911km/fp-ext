@@ -3,7 +3,7 @@
 
 跑法::
 
-    cd <data>/public/webai && python3 tests/test_capability_layer.py
+    cd <data>/public/plugins/webai/lib && python3 tests/test_capability_layer.py
 
 覆盖：
   * 向后兼容（老式 dict 仍能 coerce 成 Reply，ask() 签名未变）

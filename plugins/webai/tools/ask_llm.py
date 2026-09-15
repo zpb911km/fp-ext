@@ -2,7 +2,7 @@
 Ask LLM —— 向网页版 AI 提问（无状态单轮）
 ================================================
 
-三个工具的分工（provider 层已统一在 public/webai/，差别只在工具语义）：
+三个工具的分工（provider 层已统一在 public/plugins/webai/lib/，差别只在工具语义）：
     ask_llm  = provider.search()  无状态单轮，**总是联网检索**，返回答案 + 引用来源
     vision   = provider.ask()     无状态单轮，带图片附件（看图问答）
     copilot  = provider.ask()     有状态多轮，同一会话记得上下文（探讨 / 评审 / 结对）
@@ -10,7 +10,7 @@ Ask LLM —— 向网页版 AI 提问（无状态单轮）
 注意 ask_llm 与 vision 走的是**不同的 provider 方法**（search vs ask），
 所以不是"vision 是 ask_llm 的特例"——两者服务不同意图，故各自保留。
 
-多后端：真正的调用细节（端点 / 鉴权 / 搜索解析）在 public/webai/。
+多后端：真正的调用细节（端点 / 鉴权 / 搜索解析）在 public/plugins/webai/lib/。
 本插件只做：能力选择 + 结果格式化。
 
 provider 可选（取决于 webai 里注册了哪些）：
@@ -18,15 +18,6 @@ provider 可选（取决于 webai 里注册了哪些）：
     deepseek  结构化引用来自 response/search_results
 两者都会返回 {url, title, snippet} 形态的引用，故输出格式统一。
 """
-
-__fp__ = {
-    "name": "ask_llm",
-    "version": "2.0.0",
-    "description": "联网检索并作答（无状态单轮，多后端）",
-    "author": "zpb",
-    "license": "GPL-3.0",
-    "type": "tools",
-}
 
 import asyncio
 import importlib.util
@@ -36,34 +27,9 @@ from pathlib import Path
 from typing import Any
 
 
-def load_webai():
-    """把 public/webai 包按路径加载进来（插件加载器不往 sys.path 加目录）"""
-    # ⚠️ 不复用 sys.modules 缓存：fp 的 /reload 只重载 fp_core.* 模块，webai 不在其中，
-    #    会存活下来 → 新增 provider 后重载仍拿到旧 _MODULES（表现为"未知 provider"）。
-    #    这里每次强制从磁盘重新执行（3 个小文件，开销可忽略）。
-    for _k in [k for k in list(sys.modules) if k == "webai" or k.startswith("webai.")]:
-        sys.modules.pop(_k, None)
-    try:
-        from fp_core.platform_utils import get_data_dir
+from .. import lib as _webai
 
-        data = str(get_data_dir())
-    except Exception:
-        data = os.path.expanduser("~/.local/share/fp")
-    pkg = Path(data) / "public" / "webai"
-    if not (pkg / "__init__.py").exists():
-        return None
-    spec = importlib.util.spec_from_file_location(
-        "webai", pkg / "__init__.py", submodule_search_locations=[str(pkg)]
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["webai"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_webai = load_webai()
-
-
+TOOL_NAME = "ask_llm"
 def _search_providers() -> list:
     """只列出声明了 search 能力的后端"""
     if not _webai:
@@ -98,12 +64,12 @@ def _available_models(name: str) -> list:
 
 
 def _login_cmd(*args: str) -> str:
-    """给用户的"复制即用"命令 —— 统一入口，不必记四个 *_login.py 的名字。"""
-    try:
-        from fp_core.platform_utils import get_data_dir
-        p = Path(str(get_data_dir())) / "public" / "webai" / "login.py"
-    except Exception:  # noqa: BLE001
-        p = Path(os.path.expanduser("~/.local/share/fp/public/webai/login.py"))
+    """给用户的"复制即用"命令 —— 统一入口，不必记四个 *_login.py 的名字。
+
+    路径按**本文件位置**推算（不再假设它住在某个来源目录里）：
+    tools/<this>.py → ../lib/login.py
+    """
+    p = Path(__file__).resolve().parent.parent / "lib" / "login.py"
     tail = (" " + " ".join(args)) if args else ""
     return f"python3 {p}{tail}"
 
@@ -150,7 +116,7 @@ def ask_llm(keywords: str, provider: str = "", think: bool = False,
     返回 {answer, references, queries, raw_content, success, error}
     """
     if not _webai:
-        return _err("webai 包缺失：<数据目录>/public/webai/")
+        return _err("webai 包缺失：<数据目录>/public/plugins/webai/lib/")
 
     name = (provider or "").strip().lower()
     if name in ("", "auto"):
@@ -192,7 +158,7 @@ def ask_llm(keywords: str, provider: str = "", think: bool = False,
 
 # ── 插件定义 ────────────────────────────────────────────────────
 
-PLUGIN_DEFINITION = {
+DEFINITION = {
     "type": "function",
     "function": {
         "name": "ask_llm",

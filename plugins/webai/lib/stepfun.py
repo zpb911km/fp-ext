@@ -88,7 +88,7 @@ def available():
     ck = load_cookies()
     if not ck.get("Oasis-Token"):
         return False, ("未找到 StepFun 凭据。请先登录：\n"
-                       "    python3 <fp数据目录>/public/webai/stepfun_login.py")
+                       "    python3 <fp数据目录>/public/plugins/webai/lib/stepfun_login.py")
     return True, ""
 
 

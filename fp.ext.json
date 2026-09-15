@@ -3,25 +3,21 @@
   "author": "zpb",
   "license": "GPL-3.0",
   "assets": {
-    "tools/codegraph": {
-      "source": "codegraph",
-      "updated_at": "2026-08-04T00:45:40"
-    },
-    "tools/ask_llm": {
-      "source": "ask_llm",
-      "updated_at": "2026-08-04T02:45:14"
-    },
-    "tools/vision": {
-      "source": "vision",
-      "updated_at": "2026-08-04T02:45:15"
+    "commands/model": {
+      "source": "model",
+      "updated_at": "2026-09-03T20:43:16"
     },
     "plugins/tool_audit": {
       "source": "tool_audit",
       "updated_at": "2026-08-04T14:53:26"
     },
-    "commands/model": {
-      "source": "model",
-      "updated_at": "2026-09-03T20:43:16"
+    "plugins/webai": {
+      "source": "webai",
+      "updated_at": "2026-09-15T18:48:10"
+    },
+    "tools/codegraph": {
+      "source": "codegraph",
+      "updated_at": "2026-08-04T00:45:40"
     }
   }
 }

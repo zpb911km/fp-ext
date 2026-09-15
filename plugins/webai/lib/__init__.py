@@ -478,7 +478,7 @@ def asset_dir(name: str = "", when: float | None = None) -> str:
 
 BOOTSTRAP_SOURCE = '''
 def load_webai():
-    """把 public/webai 包按路径加载进来（插件加载器不往 sys.path 加目录）"""
+    """把 public/plugins/webai/lib 包按路径加载进来（插件加载器不往 sys.path 加目录）"""
     import importlib.util as _iu
     import sys as _sys
     from pathlib import Path as _P

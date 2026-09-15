@@ -3,7 +3,7 @@
 
 跑法::
 
-    cd <data>/public/webai && python3 tests/test_login_layer.py
+    cd <data>/public/plugins/webai/lib && python3 tests/test_login_layer.py
 
 覆盖：
   * SPEC 与注册表一致；每家都有登录脚本

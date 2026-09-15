@@ -6,10 +6,10 @@
 
 用法::
 
-    python3 <fp数据目录>/public/webai/login.py              # 检查全部；只刷"确认过期"的（需要时弹窗）
-    python3 <fp数据目录>/public/webai/login.py qwen glm     # 只处理指定几家
-    python3 <fp数据目录>/public/webai/login.py --check      # 只查状态，不开浏览器（一次轻量请求/家）
-    python3 <fp数据目录>/public/webai/login.py --all        # 强制全部刷新（没过期也刷）
+    python3 <fp数据目录>/public/plugins/webai/lib/login.py              # 检查全部；只刷"确认过期"的（需要时弹窗）
+    python3 <fp数据目录>/public/plugins/webai/lib/login.py qwen glm     # 只处理指定几家
+    python3 <fp数据目录>/public/plugins/webai/lib/login.py --check      # 只查状态，不开浏览器（一次轻量请求/家）
+    python3 <fp数据目录>/public/plugins/webai/lib/login.py --all        # 强制全部刷新（没过期也刷）
 
 状态三态（诚实优先，宁可不刷也不误刷）::
 
@@ -48,7 +48,15 @@ _LOCK = os.path.join(os.path.expanduser("~/.local/share/fp"), "webai", "login.lo
 # ── 状态检查 ────────────────────────────────────────────────────
 
 def _provider_mod(name: str):
-    return importlib.import_module(name)
+    """取 provider 模块。两种运行形态都要支持：
+
+    * 脚本模式（`python3 .../lib/login.py`）→ sys.path[0] 就是本目录 → 顶层 import
+    * 包模式（被插件 import 成 `...lib.login`）→ 走相对 import
+    """
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return importlib.import_module(f".{name}", __package__)
 
 
 def _looks_like_auth(text: str) -> bool:
@@ -65,7 +73,7 @@ def _looks_like_auth(text: str) -> bool:
         core = importlib.import_module("core")          # 脚本模式（sys.path[0]=本目录）
     except Exception:  # noqa: BLE001
         try:
-            core = importlib.import_module(".core", __package__ or "webai")   # 包模式
+            core = importlib.import_module(".core", __package__)   # 包模式
         except Exception:  # noqa: BLE001
             return False
     try:

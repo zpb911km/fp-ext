@@ -2,8 +2,8 @@
 """Qwen（chat.qwen.ai）登录器 —— 打开浏览器登录，cookie 落盘到 <数据目录>/webai/qwen/cookie。
 
 用法：
-    python3 <fp数据目录>/public/webai/qwen_login.py                 # 有头，需要时自动账密登录
-    python3 <fp数据目录>/public/webai/qwen_login.py --headless --wait 0
+    python3 <fp数据目录>/public/plugins/webai/lib/qwen_login.py                 # 有头，需要时自动账密登录
+    python3 <fp数据目录>/public/plugins/webai/lib/qwen_login.py --headless --wait 0
                                                                     # 静默：只试 profile 复用，不等人
 产出：
     <数据目录>/qwen/profile   持久化浏览器 profile（登录态留在这里 → 静默刷新依赖它）

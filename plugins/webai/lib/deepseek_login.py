@@ -2,8 +2,8 @@
 """DeepSeek 登录器 —— 打开浏览器让你登录，登录态与 token 自动落盘。
 
 用法：
-    python3 <fp数据目录>/public/webai/deepseek_login.py             # 有头，需要时等你登录
-    python3 <fp数据目录>/public/webai/deepseek_login.py --headless --wait 0
+    python3 <fp数据目录>/public/plugins/webai/lib/deepseek_login.py             # 有头，需要时等你登录
+    python3 <fp数据目录>/public/plugins/webai/lib/deepseek_login.py --headless --wait 0
                                                                     # 静默：只试 profile 复用，不等人
 产出：
     <数据目录>/deepseek/profile   持久化浏览器 profile（登录态留在这里，可复用）

@@ -160,10 +160,10 @@ def new_session(model: str = "", capability: str = "", **dialect) -> str:
 
 ## 8. 自测（必须跑，离线）
 
-在 `public/webai/` 下运行：
+在 `public/plugins/webai/lib/` 下运行：
 
 ```bash
-cd <data>/public/webai && python3 - <<'PY'
+cd <data>/public/plugins/webai/lib && python3 - <<'PY'
 import importlib.util as iu, sys
 spec = iu.spec_from_file_location("webai", "__init__.py", submodule_search_locations=["."])
 pkg = iu.module_from_spec(spec); sys.modules["webai"] = pkg; spec.loader.exec_module(pkg)
@@ -214,7 +214,7 @@ PY
 必须反过来测：把凭据换成垃圾，断言它报 `dead`。
 
 ```bash
-cd <data>/public/webai && python3 tests/check_verify_live.py --yes
+cd <data>/public/plugins/webai/lib && python3 tests/check_verify_live.py --yes
 ```
 
 这条不是可选项。2026-09 就是这么抓到的：qwen 的 verify() 原本打 `/api/v2/models`，

@@ -2,8 +2,8 @@
 """StepFun（阶跃AI）登录器 —— 打开浏览器让你扫码，登录态自动落盘。
 
 用法：
-    python3 <fp数据目录>/public/webai/stepfun_login.py              # 有头，需要时等你登录
-    python3 <fp数据目录>/public/webai/stepfun_login.py --headless --wait 0
+    python3 <fp数据目录>/public/plugins/webai/lib/stepfun_login.py              # 有头，需要时等你登录
+    python3 <fp数据目录>/public/plugins/webai/lib/stepfun_login.py --headless --wait 0
                                                                     # 静默：只试 profile 复用，不等人
 产出：
     <数据目录>/stepfun/profile     持久化浏览器 profile（扫码一次后可复用）

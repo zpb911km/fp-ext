@@ -130,7 +130,7 @@ def _device_id() -> str:
 def available():
     if not _token():
         return False, ("未找到 GLM 凭据。请先登录：\n"
-                       "    python3 <fp数据目录>/public/webai/glm_login.py")
+                       "    python3 <fp数据目录>/public/plugins/webai/lib/glm_login.py")
     return True, ""
 
 
