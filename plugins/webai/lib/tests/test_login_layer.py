@@ -63,6 +63,184 @@ class _Boom:
         return _raise
 
 
+def _mk_jwt(payload: dict) -> str:
+    """造一个"长得像"的 JWT（不签名 —— 测试只关心 payload 解析）。"""
+    import base64
+    import json as _json
+
+    def b(o):
+        return base64.urlsafe_b64encode(_json.dumps(o).encode()).rstrip(b"=").decode()
+
+    return f"h.{b(payload)}.s"
+
+
+class _Resp:
+    def __init__(self, status, body=None, set_cookie=()):
+        self.status_code = status
+        self._body = body if body is not None else {}
+        headers = type("_H", (), {"getlist": lambda _s, k: list(set_cookie)
+                                  if k.lower() == "set-cookie" else []})()
+        self.raw = type("_Raw", (), {"headers": headers})()
+
+    def json(self):
+        return self._body
+
+    def close(self):
+        pass
+
+
+def test_stepfun_renew(webai, login):
+    """§11 免浏览器续期：临期预判 / 401 重试 / **游客态 token 必须拒绝**（全离线）。"""
+    import json
+    import pathlib
+    import tempfile
+    import time
+
+    print("== 6. stepfun 免浏览器续期（PROVIDER_SPEC §11）==")
+    sf = webai.raw("stepfun")
+
+    tmp = pathlib.Path(tempfile.mkdtemp()) / "cookies.json"
+    old_cf, old_req = sf.COOKIE_FILE, sf.requests
+    old_sess, old_ref, old_load = sf._session, sf.refresh_credentials, sf.load_cookies
+
+    class _Sess:
+        def __init__(self, resp=None, always=None):
+            self.cookies = {}
+            self._resp, self._always, self.n = resp, always, 0
+
+        def post(self, *a, **k):
+            self.n += 1
+            return self._always() if self._always else self._resp
+
+    def fake_requests(payload):
+        class _R:
+            def Session(self_inner):
+                return _Sess(_Resp(200, payload))
+        return _R()
+
+    orig = {"Oasis-Token": _mk_jwt({"exp": 1}) + "..." + _mk_jwt({"exp": 9})}
+    try:
+        sf.COOKIE_FILE = tmp
+        tmp.write_text(json.dumps(orig))
+
+        # ── 6a. 游客态（200 + activated:false）必须被拒，且不得覆盖原凭据 ──
+        sf.requests = fake_requests({
+            "accessToken": {"raw": _mk_jwt({"activated": False, "exp": 9999999999})},
+            "refreshToken": {"raw": _mk_jwt({"exp": 9999999999})},
+        })
+        chk(sf.refresh_credentials() is False, "游客态 token（activated:false）被拒绝")
+        chk(json.loads(tmp.read_text()) == orig, "拒绝时不覆盖原凭据（防「过期」被刷成「权限不足」）")
+
+        # ── 6b. 激活态 → 续期成功并落盘（access...refresh 两段）──
+        good = {
+            "accessToken": {"raw": _mk_jwt({"activated": True, "exp": 9999999999})},
+            "refreshToken": {"raw": _mk_jwt({"exp": 99999999999})},
+        }
+        sf.requests = fake_requests(good)
+        chk(sf.refresh_credentials() is True, "激活态 token → 续期成功")
+        saved = json.loads(tmp.read_text())["Oasis-Token"]
+        chk(saved.count("...") == 1 and saved.startswith(good["accessToken"]["raw"]),
+            "新凭据按 access...refresh 两段落盘")
+
+        # ── 6c. 401 → 续期 → 重试一次；续期失败则不重试 ──
+        state = {"n": 0}
+
+        class _Sess401:
+            cookies = {}
+
+            def post(self, *a, **k):
+                state["n"] += 1
+                return _Resp(401 if state["n"] == 1 else 200, {})
+
+        sf._session = _Sess401
+        sf.refresh_credentials = lambda: True
+        chk(sf._call("post", "u", json={}).status_code == 200, "401 → 续期 → 重试后成功")
+        chk(state["n"] == 2, "恰好重试一次")
+
+        state["n"] = 0
+        sf.refresh_credentials = lambda: False
+        chk(sf._call("post", "u", json={}).status_code == 401, "续期失败 → 原样返回 401")
+        chk(state["n"] == 1, "续期失败不重试")
+
+        # ── 6d. 临期（<90s）→ 发请求前先续期（省掉注定 401 的往返）──
+        rented = []
+
+        class _Sess200(_Sess401):
+            def post(self, *a, **k):
+                state["n"] += 1
+                return _Resp(200, {})
+
+        sf._session = _Sess200
+        sf.load_cookies = lambda: {"Oasis-Token": _mk_jwt({"exp": int(time.time()) + 10})}
+        sf.refresh_credentials = lambda: (rented.append(1), True)[1]
+        state["n"] = 0
+        sf._call("post", "u", json={})
+        chk(rented == [1], "access 临期 → 请求前主动续期")
+
+        sf.load_cookies = lambda: {"Oasis-Token": _mk_jwt({"exp": int(time.time()) + 9999})}
+        rented.clear()
+        sf._call("post", "u", json={})
+        chk(rented == [], "寿命充足 → 不做多余续期")
+
+        # ── 6f. 回归：cookie jar 同名冲突（RequestsCookieJar.get 会抛）不得吞掉续期 ──
+        #    真实的坑：s.cookies.get("Oasis-Webid") 抛 CookieConflictError，
+        #    被宽 except 吃掉 → 续期"永远失败"→ 每次都退回开浏览器（症状=原病）。
+        sf.load_cookies = old_load
+        sf.refresh_credentials = old_ref          # ← 前面 6c/6d 的替身必须还原，否则测的是替身
+        tmp.write_text(json.dumps(orig))
+
+        class _ConflictJar(dict):
+            def get(self, k, *a):
+                raise RuntimeError("There are multiple cookies with name, 'Oasis-Webid'")
+
+        class _SessConflict(_Sess):
+            def __init__(self):
+                super().__init__(_Resp(200, good,
+                                       ["Oasis-Webid=webid_from_header; Path=/; HttpOnly"]))
+                self.cookies = _ConflictJar()
+
+        class _R:
+            def Session(self):
+                return _SessConflict()
+
+        sf.requests = _R()
+        chk(sf.refresh_credentials() is True, "cookie jar 同名冲突时续期仍成功（不许被静默吞掉）")
+        chk(json.loads(tmp.read_text()).get("Oasis-Webid") == "webid_from_header",
+            "设备指纹取自 Set-Cookie 响应头（不读会抛冲突的 jar）")
+
+        # ── 6g. 不认识的异常：降级 False，但**必须留痕**（静默失败 = 下一个 bug 温床）──
+        import contextlib
+        import io
+
+        class _Boom:
+            def Session(self):
+                raise RuntimeError("boom")
+
+        sf.requests = _Boom()
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            got = sf.refresh_credentials()
+        chk(got is False, "未知异常 → 降级 False（不向上抛）")
+        chk("续期异常" in buf.getvalue(), "未知异常必须打到 stderr（不许静默）")
+
+        # ── 6e. login.silent_refresh 先走本地续期（不再一上来就开浏览器）──
+        old_login_renew = login._provider_renew
+        old_check = login.check
+        old_lock = login._LOCK
+        login._LOCK = str(pathlib.Path(tempfile.mkdtemp()) / "login.lock")
+        login._provider_renew = lambda n: True
+        login.check = lambda n: ("ok", "")
+        os.environ.pop("FP_WEBAI_NO_AUTOLOGIN", None)
+        try:
+            chk(login.silent_refresh("stepfun") is True, "本地续期成功 → silent_refresh 不再开浏览器")
+        finally:
+            login._provider_renew, login.check = old_login_renew, old_check
+            login._LOCK = old_lock
+    finally:
+        sf.COOKIE_FILE, sf.requests = old_cf, old_req
+        sf._session, sf.refresh_credentials, sf.load_cookies = old_sess, old_ref, old_load
+
+
 def main():
     if PKG not in sys.path:
         sys.path.insert(0, PKG)          # login.py 是脚本式（import qwen / import core）
@@ -203,6 +381,8 @@ def main():
     chk(webai._heal("qwen") is False,
         "FP_WEBAI_NO_AUTOLOGIN=1 时 _heal 直接返回 False（不 spawn 登录子进程）")
     os.environ.pop("FP_WEBAI_NO_AUTOLOGIN", None)
+
+    test_stepfun_renew(webai, login)
 
     print(f"\n{'✅' if not _fail else '❌'} {_ok} passed, {_fail} failed")
     if _failed:

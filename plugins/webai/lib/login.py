@@ -153,11 +153,27 @@ def _release_lock(fd) -> None:
         pass
 
 
+def _provider_renew(name: str) -> bool:
+    """provider 自带的**免浏览器**续期钩子（SPEC §11，可选）。异常/没有 → False。
+
+    这是省下一整个浏览器进程的机会：只要 provider 能用 refresh token 在本地换
+    新凭据（如 stepfun 的 `POST …/PassportService/RefreshToken`），就不该去开
+    Playwright。实现它的 provider：`refresh_credentials() -> bool`。
+    """
+    try:
+        fn = getattr(_provider_mod(name), "refresh_credentials", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def silent_refresh(name: str, timeout: int = SILENT_TIMEOUT) -> bool:
     """**给 provider 层自愈用**：无头、不等人、硬超时、带并发锁。
 
     只在凭据"确实过期"时才有意义（调用方应确认是 AUTH 类错误再调）。
     成功回来 True —— 调用方据此重试一次。
+
+    两级：先试 provider 的免浏览器续期（SPEC §11，~0.3s），不成就开浏览器。
     """
     if os.environ.get("FP_WEBAI_NO_AUTOLOGIN"):
         return False
@@ -168,6 +184,13 @@ def silent_refresh(name: str, timeout: int = SILENT_TIMEOUT) -> bool:
     if fd is None:
         return False                      # 已有刷正在跑，别叠加
     try:
+        if _provider_renew(name):         # ① 便宜的那条路：本地换 token
+            state, msg = check(name)
+            if state == "ok":
+                print(f"[webai] {SPEC[name][1]} 凭据已本地续期（未开浏览器）", file=sys.stderr)
+                return True
+            print(f"[webai] 本地续期后仍未通过校验（{state}: {msg}）—— 改走浏览器",
+                  file=sys.stderr)
         print(f"[webai] 凭据疑似过期，尝试静默刷新 {SPEC[name][1]}…", file=sys.stderr)
         rc = _run_login(name, headless=True, wait=0, timeout=timeout)
         if rc != 0:

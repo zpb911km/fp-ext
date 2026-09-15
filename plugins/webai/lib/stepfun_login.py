@@ -48,6 +48,36 @@ def read_auth_cookie(ctx) -> dict:
     return jar if (len(tok) > 80 and tok.count(".") >= 3) else {}
 
 
+def _save(jar: dict) -> None:
+    """落盘（**原子替换**）。复用 provider 的 save_cookies —— 写盘只有一处实现。
+
+    为什么不许直接 write_text：provider 每次请求前都要读这个文件，直接写留了一个
+    "读到半个 JSON"的窗口 → JSONDecodeError → 被当成「未找到凭据」→ 假的鉴权失败。
+    """
+    try:
+        import stepfun
+        if stepfun.save_cookies(jar):
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    COOKIE_FILE.write_text(json.dumps(jar, ensure_ascii=False))
+    COOKIE_FILE.chmod(0o600)
+
+
+def _refresh_saved() -> bool:
+    """落盘后再调一次 RefreshToken，把 access 段换成新鲜的（best-effort）。
+
+    为什么需要：`Oasis-Token` 的 **access 段只活 ~29 分钟**，profile 里那份可能
+    已经到期（页面还没轮到刷新）。provider 层虽然会自愈，但登录器既然刚开过浏览器，
+    就顺手把最新凭据存下来 —— 免得"刚登录完就报鉴权失败"。失败不影响主流程。
+    """
+    try:
+        import stepfun                       # 同目录；provider 层已有该能力
+        return bool(stepfun.refresh_credentials())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main(headless: bool = False, wait_seconds: int = WAIT_SECONDS) -> int:
     silent = wait_seconds <= 0
     PROFILE.mkdir(parents=True, exist_ok=True)
@@ -87,9 +117,9 @@ def main(headless: bool = False, wait_seconds: int = WAIT_SECONDS) -> int:
         print(f"✅ 已登录，cookie {len(jar)} 项"
               + ("（profile 复用成功）" if not silent else ""))
         ROOT.mkdir(parents=True, exist_ok=True)
-        COOKIE_FILE.write_text(json.dumps(jar, ensure_ascii=False))
-        COOKIE_FILE.chmod(0o600)
+        _save(jar)
         print(f"cookie 已写入 {COOKIE_FILE}")
+        print("access 段已续期" if _refresh_saved() else "⚠️ 未能在本地续期（provider 会在调用时自愈）")
         ctx.close()
     return 0
 

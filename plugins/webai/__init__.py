@@ -16,7 +16,7 @@ __fp__ = {
     "schema": 1,
     "name": "webai",
     "type": "plugin",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "网页版 AI 多后端：ask_llm(联网检索) / vision(看图) / copilot(多轮协作)",
     "author": "zpb",
     "license": "GPL-3.0",

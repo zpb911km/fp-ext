@@ -224,16 +224,51 @@ AUTH 自愈永不触发。而当时"凭据正常 → 返回 ok"的测试**是绿
 
 `verify()` **不得**触发 `login.py`（会递归）。它只报告状态。
 
-## 10. 凭据自愈（provider 不需要写任何代码）
+## 10. 凭据自愈（默认 provider 不需要写任何代码）
 
 `webai.get()` 返回的是 `_HealingProvider` 包装：`ask / search / upload / poll` 抛出的异常
-若被 `classify()` 判为 `AUTH`，会先调 `login.silent_refresh()`（headless、不等人、
-子进程 + 硬超时 + 并发锁），成功则**重试一次**，失败则原样抛出。
+若被 `classify()` 判为 `AUTH`，会先调 `login.silent_refresh()`，成功则**重试一次**，
+失败则原样抛出。`silent_refresh()` 内部是**两级**：
 
-因此新增 provider **无需**处理登录 —— 只要：
+1. **本地续期**（SPEC §11，~0.3s）：provider 自带 `refresh_credentials()` 就直接换 token；
+2. **开浏览器**（headless、不等人、子进程 + 硬超时 + 并发锁）：兜底。
+
+因此新增 provider **默认无需**处理登录 —— 只要：
 
 1. `available()` 诚实报告本地有没有凭据；
 2. `classify()` 认得自家的鉴权方言（其余交给公共词表）；
 3. 提供 `verify()`。
 
 关掉自愈：`FP_WEBAI_NO_AUTOLOGIN=1`。
+
+## 11. `refresh_credentials() -> bool`（可选：免浏览器续期）
+
+**当本家的凭据本身是"短命 access + 长命 refresh"结构时，务必实现它。**
+
+不实现的代价（实测 stepfun）：access 段只活 ~29 分钟，过期后每次都 401；
+自愈只能开浏览器，慢且依赖 profile —— 用户体感就是"这个后端总是鉴权失败"。
+
+```python
+def refresh_credentials() -> bool:
+    """用 refresh 段换新 access 段并落盘。成功 True；可预期的失败静默 False。"""
+```
+
+要求：
+
+* **只做"续期"**，不做"登录"：没有 refresh 段/凭据真死了 → `False`（上层会开浏览器）；
+* **必须把新凭据落盘**（下次进程直接可用），权限 0600，且**原子替换**
+  （provider 每次请求前都读它 → 直写会留下"读到半个 JSON"的窗口 → 假的鉴权失败）；
+* **必须校验换回来的是不是真凭据**。反面教材（实测 stepfun）：RefreshToken 端点在
+  凭据无效时**照样回 200**，但给的是游客 token（`activated: false`，拿去调用得到
+  403 `need sign in`）—— 不校验就会把"过期"刷成"权限不足"，**比不刷新更糟**；
+* **"尽力而为"≠"静默失败"**。可预期的网络/解析异常 → `False`；
+  **不认识的异常 → 也必须 `False`，但要打到 stderr**。实测教训：一句
+  `s.cookies.get("Oasis-Webid")` 抛 `CookieConflictError`（同名 cookie 有多个域），
+  被宽 `except Exception: return False` 吃掉 → 续期"永远失败"→ 每次都退回开浏览器，
+  **症状与不修一模一样**，白忙一场。看不见的失败会伪装成"已修好"。
+  （另一条：`except (requests.RequestException, ...)` 的元组是**异常时**才求值的 ——
+  先存成模块级常量，否则 except 子句自身会抛 `AttributeError` 盖掉原始异常。）
+* 建议顺带在**真实调用前**做临期预判（如 access 剩余 <90s 就先换），省掉一次注定 401 的往返；
+* ⚠️ 有些服务端的 refresh token **一次一换**（用过的立即作废）：成功必须**立刻**落盘新的一对，
+  否则下一次续期只会拿到游客态。
+

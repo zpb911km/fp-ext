@@ -8,18 +8,25 @@ StepFun provider (chat.stepfun.com) —— 阶跃星辰「阶跃AI」
   实际是 **Connect 协议的 JSON 编码**：body 就是 JSON，不需要 protobuf。
 * 鉴权 = **cookie**（`Oasis-Token` 等），但必须同时带一组 `oasis-*` 头，
   否则服务端回 401 `oasis-token is embezzled`（不是绑定，纯粹是缺头）。
+* `Oasis-Token` = `accessJWT...refreshJWT`：**access 段只活 ~29 分钟**，
+  到期是 401 `token is expired`（不是 cookie 坏了）。靠 `_PASSPORT/RefreshToken`
+  静默续期（`refresh_credentials()`，见 PROVIDER_SPEC §11）—— 不做这步就是
+  "每半小时必鉴权失败"。游客态 token 也是 200 返回的，必须校验 `activated`。
 * ChatStream 的请求/响应都是 **Connect 信封流**：
       [1 字节 flags][4 字节大端长度][JSON payload]
     flags: 0x00=数据, 0x02=流结束
 * 服务端自持上下文：请求体**只带 chatSessionId**，不带 parentMessageId。
 
-凭据：<数据目录>/stepfun/cookies.json（由 stepfun_login.py 生成）
+凭据：<数据目录>/webai/stepfun/cookies.json（由 stepfun_login.py 生成，之后自动续期）
 """
 
+import base64
 import json
 import mimetypes
 import os
 import pathlib
+import sys
+import time
 
 import requests
 
@@ -126,6 +133,145 @@ def _check(r: requests.Response):
     return r
 
 
+# ── 凭据续期（免浏览器，见 PROVIDER_SPEC §11）───────────────────
+#
+# 【实测】`Oasis-Token` = `accessJWT...refreshJWT`，**access 段只有 ~29 分钟寿命**
+# （payload 里 exp-create_at ≈ 1800s）。过期后所有 API 一律回
+#     401 {"code":"unauthenticated","message":"token is expired"}
+# —— 这就是"stepfun 总是鉴权失败"的真身：不是 cookie 坏，是 access 段到期。
+#
+# 网页端每次进站都会调：
+#     POST /passport/proto.api.passport.v1.PassportService/RefreshToken   body {}
+# 用 refresh 段换新 access 段（响应里 `accessToken.raw` / `refreshToken.raw`，
+# 同时 Set-Cookie `Oasis-Token`）。我们在 provider 内复刻这一步 → 静默续期，
+# 不再需要每半小时开一次浏览器。
+
+REFRESH_PATH = _PASSPORT + "/RefreshToken"
+_REFRESH_SKEW = 90          # access 剩余寿命 < 90s 就提前换，省掉一次注定 401 的往返
+
+# "可预期"的续期失败（网络/解析）→ 静默降级；其余异常 → 降级但打日志。
+# ⚠️ 这两个类必须**在导入时**取好：若写成 `except (requests.RequestException, ...)`，
+#    异常处理时才会去求值 `requests`，一旦它被替换/缺失，except 子句自己会抛
+#    AttributeError 把原始异常盖掉（真实踩到过，见 tests §6g）。
+_NET_ERRORS = (requests.RequestException, ValueError, KeyError, TypeError)
+
+
+def _jwt_payload(token: str, idx: int = 0) -> dict:
+    """解 Oasis-Token 第 idx 段（0=access, 1=refresh）的 JWT payload。解不出→{}（绝不抛）。"""
+    try:
+        seg = token.split("...")[idx].split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _access_exp(ck: dict) -> int:
+    """access 段的 exp（epoch 秒）。拿不到 → 0（=不知道，交由 401 触发反应式续期）。"""
+    try:
+        return int(_jwt_payload(str(ck.get("Oasis-Token", ""))).get("exp") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def save_cookies(ck: dict) -> bool:
+    """落盘 cookie（0600，**原子替换**）。失败只回 False —— 续期是尽力而为，不因写盘失败而炸。
+
+    为什么原子：`load_cookies()` 在每次请求前都会读这个文件，而它被多个工具并发调用。
+    直接 `write_text` 有一个"读到半个 JSON"的窗口 → JSONDecodeError → 被当成
+    「未找到凭据」→ **又一个假的鉴权失败**。临时文件 + `replace()` 消除该窗口。
+    """
+    try:
+        COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = COOKIE_FILE.with_name(COOKIE_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(ck, ensure_ascii=False))
+        tmp.chmod(0o600)
+        tmp.replace(COOKIE_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def _set_cookie(r: requests.Response, name: str) -> str:
+    """从响应头 `Set-Cookie` 取某个 cookie 的值。取不到 → ""。
+
+    为什么不读 `Session.cookies`：`RequestsCookieJar.get()` 在**同名 cookie 有多个
+    域/路径**时抛 `CookieConflictError`（Oasis-Webid 同时存在于 `.stepfun.com` 与
+    `chat.stepfun.com`）。这里只要"服务端这次给我的值"，直接解析响应头最干净。
+    """
+    try:
+        for c in (r.raw.headers.getlist("Set-Cookie") or []):
+            head = c.split(";", 1)[0]
+            if "=" in head:
+                k, v = head.split("=", 1)
+                if k.strip() == name:
+                    return v
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def refresh_credentials() -> bool:
+    """用 refresh 段换新 access 段并落盘 → 是否成功。免浏览器、免登录脚本。
+
+    ⚠️ 陷阱一（服务端）：凭据无效时**照样回 200**，但给的是一个**游客 token**
+    （access 段 `activated: false`，拿去调用得到 403 `need sign in`）。
+    所以不能只看状态码 —— 必须校验 access 段是激活态，否则游客态会覆盖掉
+    好凭据（比不刷新更糟：本来只是过期，刷新后变成"权限不足"）。
+
+    ⚠️ 陷阱二（我们自己的）：这里**绝不能静默吞掉非预期异常**。踩过一次：
+    `s.cookies.get("Oasis-Webid")` 抛 `CookieConflictError`，被宽 except 吃掉
+    → 续期"永远失败"→ 每次都退回开浏览器 → 症状与原病一模一样。
+    所以：可预期的网络异常照旧回 False，**不认识的异常必须打到 stderr**。
+    """
+    ck = load_cookies()
+    if not ck.get("Oasis-Token"):
+        return False
+    try:
+        s = requests.Session()
+        s.cookies.update(ck)
+        r = s.post(f"{BASE}{REFRESH_PATH}", headers=_headers(), json={}, timeout=_HTTP_TIMEOUT)
+        if r.status_code != 200:
+            return False
+        js = r.json()
+        acc = ((js.get("accessToken") or {}).get("raw") or "")
+        ref = ((js.get("refreshToken") or {}).get("raw") or "")
+        if not acc or _jwt_payload(acc).get("activated") is False:   # ← 游客态，拒绝
+            return False
+        ck["Oasis-Token"] = acc + ("..." + ref if ref else "")
+        wid = _set_cookie(r, "Oasis-Webid")                           # 顺带刷新设备指纹，有就收
+        if wid:
+            ck["Oasis-Webid"] = wid
+        save_cookies(ck)
+        return True
+    except _NET_ERRORS as e:
+        print(f"[webai] stepfun 续期失败（{type(e).__name__}: {e}）", file=sys.stderr)
+        return False
+    except Exception as e:  # noqa: BLE001  —— 不认识的异常：照样降级，但**必须留痕**
+        print(f"[webai] stepfun 续期异常（{type(e).__name__}: {e}）—— 请当 bug 修",
+              file=sys.stderr)
+        return False
+
+
+def _call(method: str, url: str, **kw) -> requests.Response:
+    """发请求，带**本地凭据自愈**：临期先续，401 再续一次并重试。
+
+    作用域刻意只落在"真实调用"（new_session / ask / upload）上，与 __init__ 的
+    `_HealingProvider` 是**两级接力**：本地续期（~0.3s，绝大多数情况到此为止）
+    → 仍失败才轮到它去开浏览器。这样 stepfun 的 30 分钟节奏不再打穿到工具层。
+    """
+    if (exp := _access_exp(load_cookies())) and exp - time.time() < _REFRESH_SKEW:
+        refresh_credentials()
+    r = getattr(_session(), method)(url, **kw)
+    if r.status_code == 401 and refresh_credentials():
+        try:
+            r.close()
+        except Exception:  # noqa: BLE001
+            pass
+        r = getattr(_session(), method)(url, **kw)
+    return r
+
+
 # ── Connect 信封 ────────────────────────────────────────────────
 
 def encode_envelope(obj: dict) -> bytes:
@@ -152,8 +298,8 @@ def iter_envelopes(raw: bytes):
 
 def new_session(model: str = "", capability: str = "", **dialect) -> str:
     """建会话。CAPABILITY_MAP 为空 → capability / dialect 一律忽略（绝不抛异常）。"""
-    r = _session().post(f"{BASE}{SVC}/CreateChatSession",
-                        headers=_headers(), json={}, timeout=_HTTP_TIMEOUT)
+    r = _call("post", f"{BASE}{SVC}/CreateChatSession",
+              headers=_headers(), json={}, timeout=_HTTP_TIMEOUT)
     _check(r)
     if r.status_code != 200:
         raise RuntimeError(f"建会话失败 HTTP {r.status_code}: {r.text[:200]}")
@@ -188,10 +334,9 @@ def ask(session_id: str, text: str, *, parent_message_id=None, model: str = "",
     if files:
         body["message"]["content"]["userMessage"]["qa"]["attachments"] = _attachments(files)
 
-    sess = _session()
-    with sess.post(f"{BASE}{SVC}/ChatStream",
-                   headers=_headers("application/connect+json", f"{BASE}/chats/{session_id}"),
-                   data=encode_envelope(body), stream=True, timeout=_STREAM_TIMEOUT) as r:
+    with _call("post", f"{BASE}{SVC}/ChatStream",
+               headers=_headers("application/connect+json", f"{BASE}/chats/{session_id}"),
+               data=encode_envelope(body), stream=True, timeout=_STREAM_TIMEOUT) as r:
         _check(r)
         if r.status_code != 200:
             raise RuntimeError(f"ChatStream HTTP {r.status_code}: {r.text[:300]}")
@@ -380,9 +525,9 @@ def upload(path: str) -> dict:
     mime = mimetypes.guess_type(fn)[0] or "application/octet-stream"
     h = _headers()
     h.pop("content-type", None)          # 交给 requests 生成 multipart 边界
-    r = _session().post(f"{BASE}/api/resource/image", headers=h,
-                        files={"file": (fn, data, mime)},
-                        data={"scene_id": "image", "mime_type": mime}, timeout=120)
+    r = _call("post", f"{BASE}/api/resource/image", headers=h,
+              files={"file": (fn, data, mime)},
+              data={"scene_id": "image", "mime_type": mime}, timeout=120)
     _check(r)
     if r.status_code != 200:
         raise RuntimeError(f"上传失败 HTTP {r.status_code}: {r.text[:200]}")
@@ -470,6 +615,15 @@ def classify(text: str = "", status: int = 0, raw=None, exc=None, **_) -> str:
 # 8. 新增可选钩子（PROVIDER_SPEC.md）：CAPABILITY_MAP={} / models()->[] /
 #    probe()->supported=None（诚实）/ classify() 收「换个话题聊聊」=content_policy、
 #    cookie 失效=auth；不定义 poll()（无异步任务）。ask() 签名与老 key 一字未改。
+#
+# 9. 【致命】`Oasis-Token` 的 **access 段只有 ~29 分钟**（exp-create_at≈1800s）。
+#    过期后不是"cookie 坏了"，是 `401 token is expired` —— 30 分钟后必然复现，
+#    表现为用户嘴里的"stepfun 总是鉴权失败"。旧实现只靠 `login.silent_refresh`
+#    开浏览器救场（慢、依赖 playwright/profile），所以体感就是"一直在失败"。
+#    正解：**复刻网页端的 RefreshToken**（_PASSPORT/RefreshToken，body {}），
+#    用 refresh 段换新 access 段 —— 见 refresh_credentials() / _call()。
+#    ⚠️ 该端点凭据无效时**回 200 + 游客 token**（activated:false）→ 必须校验
+#    activated，否则会把"过期"刷成"权限不足"（403 need sign in），比不刷更糟。
 
 
 # ── 凭据自检（login.py 的 --check / 静默刷新后校验用）─────────────
