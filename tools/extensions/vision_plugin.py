@@ -32,8 +32,11 @@ _IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 
 def load_webai():
     """把 public/webai 包按路径加载进来（插件加载器不往 sys.path 加目录）"""
-    if "webai" in sys.modules:
-        return sys.modules["webai"]
+    # ⚠️ 不复用 sys.modules 缓存：fp 的 /reload 只重载 fp_core.* 模块，webai 不在其中，
+    #    会存活下来 → 新增 provider 后重载仍拿到旧 _MODULES（表现为"未知 provider"）。
+    #    这里每次强制从磁盘重新执行（3 个小文件，开销可忽略）。
+    for _k in [k for k in list(sys.modules) if k == "webai" or k.startswith("webai.")]:
+        sys.modules.pop(_k, None)
     try:
         from fp_core.platform_utils import get_data_dir
 

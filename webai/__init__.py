@@ -80,8 +80,10 @@ def load_webai():
     import sys as _sys
     from pathlib import Path as _P
 
-    if "webai" in _sys.modules:
-        return _sys.modules["webai"]
+    # ⚠️ 别缓存！fp 的 /reload 不会清 sys.modules["webai"]，
+    #    复用缓存会导致新增 provider 后重载仍拿到旧 _MODULES。
+    for _k in [k for k in list(_sys.modules) if k == "webai" or k.startswith("webai.")]:
+        _sys.modules.pop(_k, None)
     try:
         from fp_core.platform_utils import get_data_dir
         data = _P(get_data_dir())
