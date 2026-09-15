@@ -36,6 +36,32 @@ GET /api/v2/task/status/496149f7-03a7-401d-8b4e-de7a036cb254
 }
 ```
 
+### 交互式能力：Qwen `slides`（第三种形态 —— 多轮工作流）
+
+`slides` 不是"一次调用拿产物"，而是**两阶段交互**：
+
+| 轮次 | 输入 | 输出 | 耗时 |
+|---|---|---|---|
+| 1 | "做一份关于量子计算的3页幻灯片" | 草案（`phase:"answer"`）+ **结构化预案** `extra.draft_plan`，末尾要求回复"确认"或"开始" | ~75s |
+| 2 | "确认" | `phase:"slides"` → `extra.slides`：`slide_pages[]`（3 张 PNG 2688×1536）+ **`pdf_url`**（3 页 PDF） | **252s** |
+
+`extra.draft_plan` 是**机器可读**的（不是纯自然语言）：
+
+```jsonc
+{"version":1, "topic":"…", "topic_slug":"quantum-computing-popularization",
+ "big_idea":"…", "target_audience":"…", "density_hint":"minimal", "slide_count":3,
+ "slide_headlines":[…], "language":"zh-Hans", "master_style":"glassmorphism",
+ "must_include":[…], "must_avoid":[…], "cover_title":"…", "cover_subtitle":"…"}
+```
+
+→ **平台自己已经把"提案"结构化了**，不需要发明 `Plan` 抽象，原样搬运即可。
+
+三个后果：
+
+1. **`phase` 不能做白名单** —— 已知就有：`answer` / `thinking*` / `thinking_summary` / `image_gen` / `video_gen` / `slides` / `web_search`。漏掉一个就是**静默丢产物**（我们已经犯过一次）。
+2. **`Reply`/`Asset` 需要"原样透传 provider 元数据"的槽位**（`extra`）。能力语义千变万化，但平台已经结构化了 —— **别建模，搬运**。
+3. **一次调用可能要等 4 分钟**，工具层超时得覆盖。
+
 ---
 
 ## 2. 结论一：**不存在"独立端点"**
@@ -69,6 +95,20 @@ provider 层读到它就能决定走哪条路。
 任何"提取正文"的解析器都会把 URL 当成回答文本交给用户。
 
 → 归一化只能发生在 provider 内部，工具层拿到的必须是同一个 `Asset`。
+
+## 4.5 结论四：能力可能是**有状态的 agent**，不只是函数
+
+`slides` 会**中断并要求确认**，还用 `slides_milestone` 报进度。它的行为更像一个 sub-agent，而不是一个函数。
+
+但这对协议层**不构成新问题** —— 它只是多轮对话：
+
+- `chat_type` 在 `chats/new` 时就确定 → **能力是会话级属性**，多轮能力天然待在同一个会话里
+- "确认" 就是下一轮 `ask`
+
+→ **编排（要不要发第二轮）属于上层，不属于协议层。**
+协议层如实返回文本 + `extra` 即可；要不要确认由调用方决定。
+
+→ 这也再次否掉了 `run()` 这个动词：如果它只是"自动发确认"，那是一个**helper**，不是协议原语。
 
 ---
 
@@ -108,8 +148,9 @@ class Job:              # 所有异步长任务的统一形状（Qwen t2v 已验
 class Reply:            # 同步返回
     text: str
     thinking: str
-    assets: list[Asset] # 注意是 list —— GLM 一次给 4 张
+    assets: list[Asset] # 注意是 list —— GLM 一次给 4 张；slides 给 3 图 + 1 PDF
     references: list
+    meta: dict          # ← provider 的 extra 原文，原样透传，不做解释
 ```
 
 ### 5.3 接口（5 个动词封顶）
@@ -192,6 +233,9 @@ ErrorKind = AUTH | QUOTA | UNSUPPORTED | TRANSIENT | CONTENT_POLICY | UNKNOWN
 | Qwen 搜索需 `think=true` | `auto_search=True` 在 `think=false` 时被静默忽略 → 强制 think 后 **76s**（deepseek 仅 5s） |
 | GLM `output_image_hw` 是 `[高,宽]` | 名字骗人 |
 | GLM 没有建会话 API | 传 `""` 让服务端在首帧返回 `conversation_id`；自造 id → HTTP 200 但响应 0 字节 |
+| **`phase` 白名单漏项 = 静默丢产物** | 已知 phase 就有 7 个；`slides` 的产物全在 `phase:"slides"` 帧里 |
+| **Qwen 有阿里云 WAF** | 纯 HTTP 客户端直连 `completions` 会被 `_____tmd_____/punish?x5secdata=…` 拦（浏览器有反爬 token）。轮询类 GET 反而没事 |
+| slides 第二轮 252s | 加草案轮共约 5.5 分钟，超时设置要够 |
 
 ---
 
@@ -199,7 +243,10 @@ ErrorKind = AUTH | QUOTA | UNSUPPORTED | TRANSIENT | CONTENT_POLICY | UNKNOWN
 
 - [ ] GLM 生视频（`assistant_id=668d03b2e99d661ed3c32516`）是否同为同步 SSE？
 - [ ] GLM 的 PPT / 深度研究 / 海报 / 数据分析（`engine_*` 模式）形态未知
-- [ ] Qwen `slides` / `deep_research` / `web_dev` 形态未知
+- [ ] slides 的 `pdf_url` 与 `slide_pages` 是否总是同时给 —— 单样本
+- [x] Qwen `slides` 形态已实测 → **多轮交互**（见 §1）
+- [ ] Qwen `deep_research` / `web_dev` 形态未知
+- [ ] `slides` 的第二轮能否跳过（直接一次拿产物）—— 未试
 - [ ] `probe()` 只在 Qwen / GLM 有配置接口可依；DeepSeek 无
 - [ ] 产物 URL 的实际过期时间（Qwen JWT 有 exp；GLM `testpath` 未观察）
 
