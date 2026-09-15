@@ -40,10 +40,10 @@ except Exception:  # noqa: BLE001
 
 # provider → (凭据文件, 破坏方式)
 CASES = {
-    "qwen":     (pathlib.Path(os.path.expanduser("~/.qwen_cookie")), "text"),
-    "deepseek": (pathlib.Path(os.path.expanduser("~/.deepseek_token")), "text"),
-    "stepfun":  (DATA / "stepfun" / "cookies.json", "json_values"),
-    "glm":      (DATA / "glm" / "cookies.json", "json_values"),
+    "qwen":     (DATA / "webai" / "qwen" / "cookie", "text"),
+    "deepseek": (DATA / "webai" / "deepseek" / "token", "text"),
+    "stepfun":  (DATA / "webai" / "stepfun" / "cookies.json", "json_values"),
+    "glm":      (DATA / "webai" / "glm" / "cookies.json", "json_values"),
 }
 
 

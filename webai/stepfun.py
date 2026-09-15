@@ -64,7 +64,7 @@ def _data_dir() -> pathlib.Path:
         return pathlib.Path.home() / ".local" / "share" / "fp"
 
 
-COOKIE_FILE = _data_dir() / "stepfun" / "cookies.json"
+COOKIE_FILE = _data_dir() / "webai" / "stepfun" / "cookies.json"
 
 
 # ── 凭据 ────────────────────────────────────────────────────────

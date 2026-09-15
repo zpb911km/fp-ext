@@ -455,7 +455,7 @@ def search(name: str, query: str, **kw) -> Reply:
 
 
 def asset_dir(name: str = "", when: float | None = None) -> str:
-    """产物落盘目录（``<data>/webai_assets/<provider>/<YYYY-MM-DD>``）。
+    """产物落盘目录（``<data>/webai/assets/<provider>/<YYYY-MM-DD>``）。
 
     实测产物 URL 带 JWT（含 resource_user_id，会过期），**取到即落盘**是唯一安全做法。
     """
@@ -466,7 +466,7 @@ def asset_dir(name: str = "", when: float | None = None) -> str:
     except Exception:  # noqa: BLE001
         base = Path.home() / ".local" / "share" / "fp"
     d = time.strftime("%Y-%m-%d", time.localtime(when or time.time()))
-    p = base / "webai_assets" / (name or "_shared") / d
+    p = base / "webai" / "assets" / (name or "_shared") / d
     os.makedirs(p, exist_ok=True)
     return str(p)
 

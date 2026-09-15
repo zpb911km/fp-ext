@@ -14,7 +14,7 @@ Qwen provider (chat.qwen.ai)
 靠 `chat_type` / `sub_chat_type` 区分。⚠️ 能力是**会话级属性**（`chats/new` 时就定了），
 不是每条消息能切 —— 见 PROVIDER_SPEC.md §7 与 DESIGN.md §4.5。
 
-凭据：~/.qwen_cookie 或环境变量 QWEN_COOKIE（与 ask_llm / vision 共用）。
+凭据：<数据目录>/webai/qwen/cookie 或环境变量 QWEN_COOKIE（与 ask_llm / vision 共用）。
 """
 
 import json
@@ -36,7 +36,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
 
-_COOKIE_FILE = os.path.expanduser("~/.qwen_cookie")
+_COOKIE_FILE = os.path.expanduser("~/.local/share/fp/webai/qwen/cookie")
 _HTTP_TIMEOUT = 30
 _STREAM_TIMEOUT = 300
 
@@ -83,7 +83,7 @@ def load_cookie() -> str:
 
 def available():
     if not load_cookie():
-        return False, "未找到 Qwen cookie：~/.qwen_cookie 或环境变量 QWEN_COOKIE"
+        return False, "未找到 Qwen cookie：<数据目录>/webai/qwen/cookie 或环境变量 QWEN_COOKIE"
     return True, ""
 
 

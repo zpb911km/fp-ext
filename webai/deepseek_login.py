@@ -7,7 +7,7 @@
                                                                     # 静默：只试 profile 复用，不等人
 产出：
     <数据目录>/deepseek/profile   持久化浏览器 profile（登录态留在这里，可复用）
-    ~/.deepseek_token             Bearer token（webai 的 deepseek 后端读它）
+    <数据目录>/webai/deepseek/token             Bearer token（webai 的 deepseek 后端读它）
 
 ⚠️ token 来自 localStorage 的 userToken，是 JSON：{"value":"...","__version":"0"}，取 .value。
    未登录时它也有值但为 {"value":null} 游客占位符 —— 必须校验长度，否则会误判"已登录"。
@@ -23,8 +23,9 @@ import time
 
 from playwright.sync_api import sync_playwright
 
-PROFILE = pathlib.Path(os.path.expanduser("~/.local/share/fp/deepseek/profile"))
-TOKEN_FILE = pathlib.Path(os.path.expanduser("~/.deepseek_token"))
+_ROOT = pathlib.Path(os.path.expanduser("~/.local/share/fp")) / "webai" / "deepseek"
+PROFILE = _ROOT / "profile"
+TOKEN_FILE = _ROOT / "token"
 WAIT_SECONDS = 600
 SILENT_SECONDS = 12          # 静默模式下的短轮询：覆盖页面加载慢的情况
 

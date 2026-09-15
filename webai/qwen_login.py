@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen（chat.qwen.ai）登录器 —— 打开浏览器登录，cookie 落盘到 ~/.qwen_cookie。
+"""Qwen（chat.qwen.ai）登录器 —— 打开浏览器登录，cookie 落盘到 <数据目录>/webai/qwen/cookie。
 
 用法：
     python3 <fp数据目录>/public/webai/qwen_login.py                 # 有头，需要时自动账密登录
@@ -7,11 +7,11 @@
                                                                     # 静默：只试 profile 复用，不等人
 产出：
     <数据目录>/qwen/profile   持久化浏览器 profile（登录态留在这里 → 静默刷新依赖它）
-    ~/.qwen_cookie            **整条 cookie 串**（不是 JSON）：name=value; name=value; …
+    <数据目录>/webai/qwen/cookie            **整条 cookie 串**（不是 JSON）：name=value; name=value; …
 
 凭据来源（按优先级）：
     环境变量 QWEN_EMAIL / QWEN_PASSWORD
-    ~/.qwen_credentials    {"email": "...", "password": "..."}   chmod 600
+    <数据目录>/webai/qwen/credentials.json    {"email": "...", "password": "..."}   chmod 600
 无凭据时会退化为"等人手动登录"。
 
 ⚠️ cookie 里的 token 是 JWT，有效期约 1 个月；过期重跑本脚本即可。
@@ -35,10 +35,10 @@ try:
 except Exception:  # noqa: BLE001
     DATA = pathlib.Path.home() / ".local" / "share" / "fp"
 
-ROOT = DATA / "qwen"
+ROOT = DATA / "webai" / "qwen"
 PROFILE = ROOT / "profile"
-COOKIE_FILE = pathlib.Path(os.path.expanduser("~/.qwen_cookie"))
-CRED_FILE = pathlib.Path(os.path.expanduser("~/.qwen_credentials"))
+COOKIE_FILE = ROOT / "cookie"            # 整条 cookie 串（原 <数据目录>/webai/qwen/cookie）
+CRED_FILE = ROOT / "credentials.json"    # 可选账密（原 <数据目录>/webai/qwen/credentials.json）
 WAIT_SECONDS = 600
 SILENT_SECONDS = 12
 BASE = "https://chat.qwen.ai"
@@ -46,7 +46,7 @@ COOKIE_DOMAINS = ("chat.qwen.ai", ".qwen.ai", "qwen.ai")
 
 
 def load_credentials() -> tuple[str, str]:
-    """账密：环境变量优先，其次 ~/.qwen_credentials。"""
+    """账密：环境变量优先，其次 <数据目录>/webai/qwen/credentials.json。"""
     email = os.environ.get("QWEN_EMAIL", "").strip()
     pwd = os.environ.get("QWEN_PASSWORD", "").strip()
     if not (email and pwd):
@@ -126,7 +126,7 @@ def main(headless: bool = False, wait_seconds: int = WAIT_SECONDS) -> int:
                     print("尝试用已保存的账密自动登录…")
                     _try_password_login(page, email, pwd)
                 else:
-                    print("⚠️ 未找到账密（QWEN_EMAIL/QWEN_PASSWORD 或 ~/.qwen_credentials），请手动登录。")
+                    print("⚠️ 未找到账密（QWEN_EMAIL/QWEN_PASSWORD 或 <数据目录>/webai/qwen/credentials.json），请手动登录。")
                 print(f"等待登录完成，最多 {wait_seconds} 秒（可能有人机验证，请留意浏览器窗口）…")
                 deadline = time.time() + wait_seconds
                 ok = False

@@ -103,7 +103,7 @@ def _data_dir() -> pathlib.Path:
         return pathlib.Path.home() / ".local" / "share" / "fp"
 
 
-CRED_FILE = _data_dir() / "glm" / "cookies.json"
+CRED_FILE = _data_dir() / "webai" / "glm" / "cookies.json"
 
 
 # ── 凭据 ────────────────────────────────────────────────────────

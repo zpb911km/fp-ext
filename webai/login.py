@@ -42,7 +42,7 @@ SPEC = {
 
 SILENT_TIMEOUT = 45        # 静默刷新的硬上限（秒）：playwright 启动 + 短轮询
 INTERACTIVE_TIMEOUT = 700  # 人工登录的上限（略大于脚本自身的 600s 等待）
-_LOCK = os.path.join(os.path.expanduser("~/.local/share/fp"), "webai_login.lock")
+_LOCK = os.path.join(os.path.expanduser("~/.local/share/fp"), "webai", "login.lock")
 
 
 # ── 状态检查 ────────────────────────────────────────────────────

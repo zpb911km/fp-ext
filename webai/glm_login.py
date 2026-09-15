@@ -30,7 +30,7 @@ try:
 except Exception:  # noqa: BLE001
     DATA = pathlib.Path.home() / ".local" / "share" / "fp"
 
-ROOT = DATA / "glm"
+ROOT = DATA / "webai" / "glm"
 PROFILE = ROOT / "profile"
 CRED_FILE = ROOT / "cookies.json"
 WAIT_SECONDS = 600

@@ -19,7 +19,7 @@ chat / search / vision 同样共用一个 completion 端点：
 接口，诚实返回空）、probe() 一律 supported=None、classify() 认本家方言 rate_limit_reached→quota；
 无异步任务故不实现 poll()。SSE 解析把出现过的每个通道收进 phases —— 未知 phase/event 不丢。
 
-凭据：~/.deepseek_token（来自浏览器 localStorage userToken.value）。
+凭据：<数据目录>/webai/deepseek/token（来自浏览器 localStorage userToken.value）。
 刷新：运行 deepseek_login.py 走一次 Playwright 登录。
 """
 
@@ -49,8 +49,9 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
 
-TOKEN_FILE = pathlib.Path(os.path.expanduser("~/.deepseek_token"))
-CACHE_DIR = pathlib.Path(os.path.expanduser("~/.local/share/fp/deepseek"))
+_ROOT = pathlib.Path(os.path.expanduser("~/.local/share/fp")) / "webai" / "deepseek"
+TOKEN_FILE = _ROOT / "token"          # 旧位置: /webai/deepseek/token
+CACHE_DIR = _ROOT
 WASM_FILE = CACHE_DIR / "sha3_wasm_bg.wasm"
 WASM_URL = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
 
