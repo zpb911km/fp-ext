@@ -298,7 +298,22 @@ def copilot_say(
         return {"success": False, "session": session,
                 "error": "回答为空（可能被限流或内容审核；服务端未回传错误详情）"}
 
-    rec["last_response_id"] = out.get("message_id") or rec.get("last_response_id")
+    # ── 续接指针：拿不到就必须**说出来** ──
+    # 静默沿用旧 parent，等于让下一轮挂回上一轮的回答上 —— 会话树分叉，
+    # 对方"记不起刚说过的话"。用户体感就是"聊着聊着断联了"，而且不报错。
+    prev_parent = rec.get("last_response_id")
+    new_parent = out.get("message_id")
+    rec["last_response_id"] = new_parent or prev_parent
+    warnings = []
+    if not new_parent:
+        warnings.append(
+            "本轮没拿到续接指针（message_id），下一轮仍挂在上一轮回答上 —— "
+            "若它「记不起」刚说的话，用 action=new 重建会话（会丢上下文）"
+        )
+    if out.get("truncated"):
+        why = f"：{out['truncated_reason']}" if out.get("truncated_reason") else ""
+        warnings.append(f"回答可能被截断（流被中断，不是正常收尾）{why}")
+
     # 有些后端（如 GLM）没有"建会话"API：会话由首条消息隐式创建，
     # 真实 id 由 ask() 带出，这里回写。其他后端不返回 session_id，无副作用。
     if out.get("session_id"):
@@ -321,6 +336,7 @@ def copilot_say(
         "model": rec["model"],
         "chat_id": rec["chat_id"],
         "provider": rec.get("provider", prov),
+        "warnings": warnings,
     }
 
 
@@ -483,7 +499,8 @@ async def execute(params: dict[str, Any]) -> str:
     if not res.get("success"):
         return f"❌ copilot 失败：{res.get('error')}"
 
+    warn = "".join(f"\n⚠️ {w}" for w in (res.get("warnings") or []))
     return (
         f"🧠 [copilot:{res['session']} · {res.get('provider', 'qwen')} · "
-        f"第{res['turns']}轮 · {res['model']}]\n{res['answer']}"
+        f"第{res['turns']}轮 · {res['model']}]\n{res['answer']}{warn}"
     )

@@ -53,6 +53,8 @@ GLM 用的是 `assistant_id` 而不是 `chat_type`，那就填 `{"assistant_id":
     "extra":   dict,         # 原样透传的关键 extra（不要加工）
     "status":  str,          # 仅在"交互式能力在追问"时填 "needs_input"
     "task_id": str, "task_status": str,   # 异步任务：提交后立刻返回
+    "truncated": bool,       # ⚠️ 见 §12：流**被中断**（不是正常收尾）时填 True
+    "truncated_reason": str, # 可选，中断的原始异常（便于排查）
 }
 ```
 
@@ -226,9 +228,22 @@ AUTH 自愈永不触发。而当时"凭据正常 → 返回 ok"的测试**是绿
 
 ## 10. 凭据自愈（默认 provider 不需要写任何代码）
 
-`webai.get()` 返回的是 `_HealingProvider` 包装：`ask / search / upload / poll` 抛出的异常
-若被 `classify()` 判为 `AUTH`，会先调 `login.silent_refresh()`，成功则**重试一次**，
-失败则原样抛出。`silent_refresh()` 内部是**两级**：
+`webai.get()` 返回的是 `_HealingProvider` 包装，它有**两条互不串门的通道**：
+
+| 归类 | 动作 | 为什么 |
+|---|---|---|
+| `AUTH` | 调 `login.silent_refresh()` → 成功则**立刻**重试（不退避，只刷一次） | 换凭据是唯一出路 |
+| `TRANSIENT` | **退避重试** 2 次（0.8s / 2.5s） | 网络断流 / 5xx / 读超时，重发大概率就好 |
+| 其余 | 原样抛出，不重试 | `QUOTA` 该停手、`UNSUPPORTED` 该换家、`CONTENT_POLICY` 重试无用 |
+
+> **TRANSIENT 这条是踩出来的**（2026-09 用户反馈"copilot 里 qwen 老是断联"）：
+> 以前这里只认 `AUTH`，网络抖一下就直接抛给用户 —— 而 qwen 恰好是 copilot 的默认后端，
+> 所以看起来像"qwen 的问题"。判据是：**各类错误的动作是相反的**，
+> 判错会让调用方做相反的事，所以 `TRANSIENT` 必须与 `AUTH` 分开。
+>
+> 关掉重试：`FP_WEBAI_NO_RETRY=1`。
+
+`silent_refresh()` 内部是**两级**：
 
 1. **本地续期**（SPEC §11，~0.3s）：provider 自带 `refresh_credentials()` 就直接换 token；
 2. **开浏览器**（headless、不等人、子进程 + 硬超时 + 并发锁）：兜底。
@@ -240,6 +255,18 @@ AUTH 自愈永不触发。而当时"凭据正常 → 返回 ok"的测试**是绿
 3. 提供 `verify()`。
 
 关掉自愈：`FP_WEBAI_NO_AUTOLOGIN=1`。
+
+### `no_retry` 标记（避免"内层重发 × 外层重发"）
+
+provider 若**已经自己重发过**，或某错误**重发治不了**，请给异常打标记：
+
+```python
+err = WebAIError("transient", "…")
+err.no_retry = True
+raise err
+```
+
+否则一个用户请求会被打成一串（qwen 实测：内层 2 次 × 外层 3 次 = 6 发）。
 
 ## 11. `refresh_credentials() -> bool`（可选：免浏览器续期）
 
@@ -272,3 +299,34 @@ def refresh_credentials() -> bool:
 * ⚠️ 有些服务端的 refresh token **一次一换**（用过的立即作废）：成功必须**立刻**落盘新的一对，
   否则下一次续期只会拿到游客态。
 
+## 12. 流完整性：`truncated` 与"什么才算截断"
+
+**症状**：多轮对话"聊着聊着断了"——回答短了一截、或对方下一轮忽然记不起刚才说的话。
+
+**要求**：`ask()` 收到**传输层中断**时，已收到的内容**照常返回**（铁律：不丢东西），
+但必须带 `truncated=True`（+ 可选 `truncated_reason`）。上层据此提示用户，
+而不是静默把半截回答当完整回答。
+
+### ⚠️ 判据是"有没有报错"，不是"有没有 `[DONE]`"
+
+这条是**联网实测**出来的（2026-09）：
+
+* **qwen 的 SSE 根本不发 `data: [DONE]`**。它靠 `Transfer-Encoding: chunked`
+  正常收尾；末帧带 `usage.total_tokens`，但 `usage` 从第 2 帧起就一直在，
+  **当不了结束标记**。所以"没见到 `[DONE]`"绝不能当截断 ——
+  第一版就是这么写的，结果**每一次正常回答都被误报成 truncated**（本地离线测试全绿，
+  是 `check_qwen_resilience_live.py` 抓出来的）。
+* 可靠信号只有一个：**传输层报错**。分块编码下服务端没写完就断开，
+  urllib3 会抛 `IncompleteRead` → `ChunkedEncodingError`。
+* **诚实边界**：服务端**主动**提前结束（风控掐断 / 用户点停止）在协议层没有任何标记，
+  客户端分不出来。别假装能检测 —— 把它写成"疑似截断"只会变成狼来了。
+
+### 重发规则（与"不重复提问"的权衡）
+
+* **一个字都没收到** → 可以重发（此时服务端大概率没落地）。重发请**复用同一份请求体**
+  （含同一个 `fid`/`timestamp`），给服务端去重的机会；
+* **已经收到内容** → **不要**重发。重发会让对方收到两条相同的提问，
+  比"回答短了一截"更糟。返回内容 + `truncated=True` 即可。
+* 内层重发用尽后，抛出的异常请打 `no_retry`（见 §10），别让外层再退避一遍。
+
+参考实现：`qwen.py` 的 `_collect_stream()` / `ask()`；联网验收：`tests/check_qwen_resilience_live.py`。

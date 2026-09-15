@@ -67,6 +67,7 @@ provider 契约
 import functools
 import importlib
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -98,11 +99,32 @@ _HEAL_METHODS = ("ask", "search", "upload", "poll")
 _ENV_OFF = "FP_WEBAI_NO_AUTOLOGIN"
 
 
-def _is_auth_error(name: str, exc: BaseException) -> bool:
+def _kind_of(name: str, exc: BaseException) -> ErrorKind:
+    """归不出类别时返回 UNKNOWN（=不重试、不刷新）—— 猜错比不猜更糟。"""
     try:
-        return classify(name, exc) == ErrorKind.AUTH
+        return classify(name, exc)
     except Exception:  # noqa: BLE001
-        return False
+        return ErrorKind.UNKNOWN
+
+
+def _is_auth_error(name: str, exc: BaseException) -> bool:
+    return _kind_of(name, exc) == ErrorKind.AUTH
+
+
+# ── 抖动重试（TRANSIENT）─────────────────────────────────────────
+# 只给 TRANSIENT 开这个口子，因为各类错误的**动作是相反的**：
+#   AUTH       → 换凭据（重发没用）
+#   QUOTA      → 停手（重发更糟）
+#   UNSUPPORTED→ 换一家（重发没意义）
+#   TRANSIENT  → 重发（这才会好）
+# 以前这里只认 AUTH，网络抖一下就直接抛给用户 —— 用户体感就是"聊到一半断了"。
+_RETRY_BACKOFF = (0.8, 2.5)          # 第 1 次 / 第 2 次重试前的退避秒数
+_ENV_NO_RETRY = "FP_WEBAI_NO_RETRY"
+
+
+def _retry_backoff() -> tuple:
+    """退避表；`FP_WEBAI_NO_RETRY=1` 可关掉（调试 / 测试时用）。"""
+    return () if os.environ.get(_ENV_NO_RETRY) else _RETRY_BACKOFF
 
 
 def _heal(name: str) -> bool:
@@ -124,16 +146,42 @@ def _heal(name: str) -> bool:
 
 
 def _wrap_heal(name, fn):
-    """AUTH 错误 → 静默刷新一次 → 重试一次（**只重试一次**，避免打转）。"""
+    """两条自愈通道，互不串门：
+
+    * **AUTH** → 静默刷新凭据（headless）→ 成功则**立刻**重试，不退避
+      （刷新本身就是那几秒等待）；只刷一次，避免打转。
+    * **TRANSIENT** → 退避重试 `_RETRY_BACKOFF` 次（网络断流 / 5xx / 读超时）。
+
+    ⚠️ 重试**不是幂等**的：provider 若不能在重发时复用同一份请求体
+    （如 qwen 的流式发消息），它应当**自己**在内部重试，别指望这一层
+    —— 否则可能往会话里插入第二条相同的用户消息。这里只兜"请求根本没落地"的抖动。
+    """
 
     @functools.wraps(fn)
     def wrapper(*a, **kw):
-        try:
-            return fn(*a, **kw)
-        except Exception as e:  # noqa: BLE001
-            if _is_auth_error(name, e) and _heal(name):
+        attempt = 0
+        healed = False
+        while True:
+            try:
                 return fn(*a, **kw)
-            raise
+            except Exception as e:  # noqa: BLE001
+                kind = _kind_of(name, e)
+                if kind == ErrorKind.AUTH and not healed and _heal(name):
+                    healed = True
+                    continue
+                backoff = _retry_backoff()
+                # `no_retry`：provider 已经自己重发过（或用重发也治不了，如 WAF 挑战）。
+                # 不认这个标记就会形成"内层重发 × 外层重发"的乘法，白打一串请求。
+                if (kind == ErrorKind.TRANSIENT and not getattr(e, "no_retry", False)
+                        and attempt < len(backoff)):
+                    wait = backoff[attempt]
+                    attempt += 1
+                    # 留痕：看不见的重试会让"偶发失败"永远查不出来
+                    print(f"[webai] {name} 抖动重试 {attempt}/{len(backoff)}"
+                          f"（{wait}s 后）：{type(e).__name__}: {e}", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                raise
 
     return wrapper
 

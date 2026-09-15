@@ -21,10 +21,16 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import time
 import uuid
 
 import requests
+
+try:                                    # provider → core 是允许的方向（core.py 顶部声明）
+    from . import core as _core
+except Exception:                       # noqa: BLE001  被当独立模块加载时降级
+    _core = None
 
 name = "qwen"
 capabilities = {"chat", "search", "vision"}
@@ -39,6 +45,13 @@ USER_AGENT = (
 _COOKIE_FILE = os.path.expanduser("~/.local/share/fp/webai/qwen/cookie")
 _HTTP_TIMEOUT = 30
 _STREAM_TIMEOUT = 300
+
+# 流重试：**只在"一个字都没收到"时**重发（见 ask()）。带着半截回答重发会污染会话。
+_STREAM_ATTEMPTS = 2
+_STREAM_RETRY_BACKOFF = 1.2
+
+_NET_ERRORS = (requests.exceptions.RequestException, OSError)
+
 
 
 # ── 能力方言（PROVIDER_SPEC.md §1）──────────────────────────────
@@ -115,6 +128,113 @@ def _session() -> requests.Session:
     return s
 
 
+# ── 错误收口：HTTP / WAF / 解析失败 → 一律带归类 ─────────────────
+#
+# 为什么必须收口（实测 2026-09）：WAF 挑战页是 **HTTP 200 + text/html**，
+# 于是 `r.json()` 抛 `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`
+# —— 一句与真实原因毫无关系的乱码。`new_session()` 以前正是如此：用户看到的是
+# 莫名其妙的"断了"，而不是"被 WAF 拦了"。
+#
+# 另一件事必须说清：**WAF 与登录态无关**。实测消融（cookie 全删风控指纹
+# tfstk/isg/ssxmod_itna/acw_tc 照样 200 通过；只留 UA 则被拦；UA 换成
+# python-requests 被拦、curl 放行）。判别维度是**请求头指纹**，不是凭据。
+# 所以这里的文案刻意**不提 cookie 失效** —— 否则会把排查引向重新登录（白忙）。
+_WAF_MSG = (
+    "请求被 Aliyun WAF 判定为自动化（与登录态无关）。"
+    "判别依据是请求头指纹 / UA，不是 cookie —— 实测风控 cookie 全删也照样通过。"
+    "重登无用；请检查 _headers() 是否被改动、UA 是否被替换成库 UA"
+    "（python-requests 被点名拦截，curl 反而放行）。"
+)
+
+
+def _new_error(kind: str, message: str, *, raw=None) -> Exception:
+    if _core is not None:
+        return _core.WebAIError(kind, message, provider="qwen", raw=raw)
+    return RuntimeError(f"{kind}: {message}")
+
+
+def _no_retry(err: Exception) -> Exception:
+    """打上"别让上层再重发"的标记（`__init__._wrap_heal` 认得它）。
+
+    两种情形必须打：
+    * **ask() 内部已经重发过** —— 而且是**复用同一份请求体**重发的，
+      比上层重建一个新 fid 去重发安全得多（少一次"会话里多一条相同提问"的机会）；
+    * **WAF 挑战** —— 那是请求指纹配置问题，不是抖动。重发既不会变好，
+      还会连续喂给风控引擎、反而抬高风险分。
+    """
+    try:
+        err.no_retry = True          # type: ignore[attr-defined]
+    except Exception:                # noqa: BLE001
+        pass
+    return err
+
+
+def _is_waf(body: str) -> bool:
+    """WAF 挑战页 / 任意 HTML 页 —— 它们都不可能是本接口的正常响应。"""
+    head = (body or "")[:2048].lstrip().lower()
+    return ("aliyun_waf" in head
+            or head.startswith("<!doctype")
+            or head.startswith("<html"))
+
+
+def _snippet(s, n: int = 300) -> str:
+    s = " ".join((s or "").split())
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def _raise_for(r, body: str) -> None:
+    """HTTP 层收口：WAF 挑战 / 非 2xx。不返回，只在出错时抛。"""
+    if _is_waf(body):
+        # 与登录态无关（见 _WAF_MSG）；重发无益 → 标记 no_retry
+        raise _no_retry(_new_error("transient", _WAF_MSG, raw=_snippet(body, 400)))
+    if r.status_code >= 400:
+        kind = _core.classify_text(body, status=r.status_code).value if _core else ""
+        raise _new_error(
+            kind or "transient",
+            f"HTTP {r.status_code}：{_snippet(body, 300)}",
+            raw=_snippet(body, 400),
+        )
+
+
+def _json(r, what: str) -> dict:
+    """`r.json()` 的安全版：WAF / 非 JSON 响应不再冒泡成 JSONDecodeError。"""
+    text = r.text
+    _raise_for(r, text)
+    try:
+        return r.json()
+    except ValueError:          # requests 的 JSONDecodeError 也继承自 ValueError
+        raise _new_error("transient",
+                         f"{what}：响应不是 JSON（{_snippet(text)}）", raw=_snippet(text, 400))
+
+
+def _collect_stream(r) -> tuple:
+    """收 SSE 行 → `(raw, 是否见到 [DONE], 中断异常|None)`。
+
+    ⚠️ **实测（2026-09，联网）：qwen 的流根本不发 `data: [DONE]`。**
+    它靠 `Transfer-Encoding: chunked` 正常收尾（末帧带 `usage.total_tokens`，
+    但 `usage` 从第 2 帧起就一直在，**当不了结束标记**）。所以"没见到 [DONE]"
+    **不能**当作被截断 —— 那会把每一次正常回答都误报成 truncated。
+
+    可靠的截断信号只有一个：**传输层报错**。分块编码下服务端若没写完就断开，
+    urllib3 会抛 `IncompleteRead` → `ChunkedEncodingError`。
+    反过来，服务端**主动**提前结束（风控掐断 / 用户点停止）在协议层没有任何标记，
+    客户端分不出来 —— 这是本方法的诚实边界，别假装能检测。
+
+    断流时已收到的内容**照收不误**（铁律：不丢东西），由调用方决定怎么办。
+    """
+    buf: list = []
+    try:
+        for line in r.iter_lines(decode_unicode=True):
+            if line is None:
+                continue
+            buf.append(line)
+            if line.strip() == "data: [DONE]":
+                return "\n".join(buf) + "\n", True, None
+    except _NET_ERRORS as e:
+        return "\n".join(buf) + "\n", False, e
+    return "\n".join(buf) + "\n", False, None
+
+
 # ── 会话 ────────────────────────────────────────────────────────
 
 def new_session(model: str = "", capability: str = "", **dialect) -> str:
@@ -137,10 +257,14 @@ def new_session(model: str = "", capability: str = "", **dialect) -> str:
         f"{API_BASE}/api/v2/chats/new", headers=_headers(),
         json=body, timeout=_HTTP_TIMEOUT,
     )
-    r.raise_for_status()
-    j = r.json()
+    j = _json(r, "建会话")
     if not j.get("success"):
-        raise RuntimeError(f"建会话失败: {j}")
+        # 服务端把错误码放在 body 里（如 {"code":"Unauthorized",...}）→ 归类后再抛，
+        # 让 AUTH 仍然能触发上层凭据自愈（老行为：靠 RuntimeError 文案被词表捞到）。
+        blob = json.dumps(j, ensure_ascii=False)
+        kind = _core.classify_text(blob).value if _core else ""
+        raise _new_error(kind or "unknown",
+                         f"建会话失败：{_snippet(blob, 200)}", raw=j)
 
     sid = j["data"]["id"]
     ct = body.get("chat_type", "")
@@ -174,8 +298,7 @@ def upload(path: str) -> dict:
         json={"filename": filename, "filesize": str(len(data)), "filetype": filetype},
         timeout=_HTTP_TIMEOUT,
     )
-    r.raise_for_status()
-    sts = r.json()
+    sts = _json(r, "取 OSS STS")
 
     auth = oss2.StsAuth(sts["access_key_id"], sts["access_key_secret"], sts["security_token"])
     bucket = oss2.Bucket(auth, f"https://{sts['endpoint']}", sts["bucketname"])
@@ -484,8 +607,7 @@ def _ask_async(session_id: str, body: dict, model: str) -> dict:
         f"{API_BASE}/api/v2/chat/completions?chat_id={session_id}",
         headers=_headers(), json=body, timeout=_HTTP_TIMEOUT,
     )
-    r.raise_for_status()
-    j = r.json()
+    j = _json(r, "异步提交")
     data = j.get("data") if isinstance(j, dict) else None
     if not isinstance(data, dict):
         data = j if isinstance(j, dict) else {}
@@ -572,37 +694,60 @@ def ask(
     if is_async:
         return _ask_async(session_id, body, model)
 
-    r = _session().post(
-        f"{API_BASE}/api/v2/chat/completions?chat_id={session_id}",
-        headers={
-            **_headers(),
-            "Accept": "application/json, text/event-stream",
-            "X-Accel-Buffering": "no",
-        },
-        json=body, stream=True, timeout=_STREAM_TIMEOUT,
-    )
-    r.raise_for_status()
+    url = f"{API_BASE}/api/v2/chat/completions?chat_id={session_id}"
+    hdrs = {
+        **_headers(),
+        "Accept": "application/json, text/event-stream",
+        "X-Accel-Buffering": "no",
+    }
+    # 请求体**固化**后再发：重试时复用同一份字节（含同一个 fid / timestamp），
+    # 让服务端有机会把它认成同一条消息，而不是往会话里插两条。
+    payload = json.dumps(body, ensure_ascii=False).encode()
 
-    raw = ""
-    for line in r.iter_lines(decode_unicode=True):
-        if line is None:
-            continue
-        raw += line + "\n"
-        if line.strip() == "data: [DONE]":
+    # `saw_done` 只作记录用：qwen 本来就不发 [DONE]，它当不了完整性判据（见 _collect_stream）
+    raw, _saw_done, dropped = "", False, None
+    for attempt in range(_STREAM_ATTEMPTS):
+        if attempt:
+            time.sleep(_STREAM_RETRY_BACKOFF)
+        r = _session().post(url, headers=hdrs, data=payload,
+                            stream=True, timeout=_STREAM_TIMEOUT)
+        try:
+            if r.status_code >= 400:
+                _raise_for(r, r.text[:2048])        # 非 2xx：带 body 归类后抛
+            raw, _saw_done, dropped = _collect_stream(r)
+        finally:
+            r.close()
+        _raise_for(r, raw)                          # WAF 挑战页（HTTP 200 + HTML）
+        # 只有"一个字都没收到"才重发 —— 半截回答不能被覆盖（宁留半截，不重复提问）
+        if raw.strip():
             break
+        if dropped is not None:
+            print(f"[webai] qwen 流中断（{type(dropped).__name__}: {dropped}），"
+                  f"未收到任何内容，重发", file=sys.stderr)
+    else:
+        raise _no_retry(_new_error("transient",
+                                   "流未正常结束且没收到任何内容（连接被中断？）",
+                                   raw=raw[:400]))
 
-    if raw.lstrip().startswith("<!doctype") or "aliyun_waf" in raw[:2000]:
-        raise RuntimeError("被 WAF 拦截（cookie 可能失效，见记忆 qwen_cookie_refresh）")
     head = raw.split("\n")[0] if raw else ""
     if '"ret"' in head and "FAIL" in head:
         try:
             err = json.loads(head[6:] if head.startswith("data: ") else head)
             ret = err.get("ret", ["未知错误"])
-            raise RuntimeError(f"API 拒绝: {ret[1] if len(ret) > 1 else ret[0]}")
+            raise _new_error("unknown",
+                             f"API 拒绝：{ret[1] if len(ret) > 1 else ret[0]}", raw=ret)
         except json.JSONDecodeError:
             pass
 
-    return _parse_sse(raw)
+    out = _parse_sse(raw)
+    if dropped is not None:
+        # 传输层中断：半截回答**照样返回**（铁律：不丢东西），但必须打标记。
+        # 静默把"被截断"当成"完整"，正是"上下文莫名错位"的根源。
+        out["truncated"] = True
+        out["truncated_reason"] = f"{type(dropped).__name__}: {dropped}"
+        print(f"[webai] qwen 流中断（已收 {len(raw)} 字节）→ 标记 truncated："
+              f"{out['truncated_reason']}", file=sys.stderr)
+    return out
 
 
 # ── 便捷：一次性联网搜索 ────────────────────────────────────────
@@ -756,6 +901,12 @@ def classify(text: str = "", status: int = 0, raw=None, exc=None) -> str:
             blob = str(raw.get("message") or raw.get("error") or raw.get("msg") or "")
     low = blob.lower()
     for hint, kind in (
+        # ⚠️ WAF 挑战**必须**先于通用词表判掉。挑战页里常带 "acw_sc__v2"/"acw_tc"
+        # 之类字样，而 core 的 AUTH 词表含 "cookie expired"/"签名" —— 一旦落到
+        # 通用词表就可能被归成 AUTH，把"请求指纹不对"误诊成"凭据过期"，
+        # 于是白刷一次登录。实测 WAF 与凭据**完全无关**。
+        ("aliyun_waf", "transient"),
+        ("acw_sc", "transient"),
         ("该模型不可用", "unsupported"),   # 实测本家方言
         ("模型不可用", "unsupported"),
         ("模型不存在", "unsupported"),
@@ -787,8 +938,7 @@ def poll(job) -> dict:
 
     r = _session().get(f"{API_BASE}/api/v2/task/status/{task_id}", headers=_headers(),
                        timeout=_HTTP_TIMEOUT)
-    r.raise_for_status()
-    j = r.json()
+    j = _json(r, "任务状态")
     data = j.get("data") if isinstance(j, dict) else None
     if not isinstance(data, dict):
         data = j if isinstance(j, dict) else {}
