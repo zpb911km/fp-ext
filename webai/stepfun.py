@@ -345,16 +345,11 @@ def _harvest_assets(body) -> list:
 def search(query: str, *, think: bool = False, model: str = "") -> dict:
     sid = new_session(model)
     r = ask(sid, query, model=model, think=think, search=True)
-    out = {
-        "text": r["text"],
-        "references": r["references"],
-        "queries": r["queries"],
-        "session_id": sid,
-        "message_id": r["message_id"],
-    }
-    for k in ("assets", "model", "phases", "extra"):   # 顺手透传新键（老 key 不变）
-        if k in r:
-            out[k] = r[k]
+    # 原样带上 ask() 的**所有**键（含将来新增的），只补 session_id。
+    # 之前这里手写 5 个键 —— 新增的 assets/phases/model/extra 会被静默丢掉，
+    # 正是"未知的东西不能丢"在 search() 边界上被违反。
+    out = dict(r)
+    out.setdefault("session_id", sid)
     return out
 
 

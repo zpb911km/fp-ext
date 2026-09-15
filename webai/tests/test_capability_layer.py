@@ -184,6 +184,35 @@ def main():
         got = webai.classify(prov, text=txt).value
         chk(got == want, f"classify({prov}, {txt!r}) -> {got}（期望 {want}）")
 
+    print("== 9b. search() 必须透传新键（不许手写 5 个键）==")
+    # 曾经的 bug：search() 里手写 {"text","references","queries","session_id","message_id"}，
+    # 于是 assets/phases/model/extra 被静默丢掉。这里用假 ask 逼出来。
+    for n in webai.names():
+        m = webai.get(n)
+        if not callable(getattr(m, "search", None)):
+            continue
+        fake = {
+            "text": "T", "references": [{"url": "u"}], "queries": ["q"],
+            "message_id": "m", "session_id": "REAL-SID",
+            "assets": [{"kind": "image", "url": "https://x/1.png"}],
+            "phases": {"answer": "T", "brand_new": "z"},
+            "model": "some-model", "extra": {"k": 1},
+            "某个将来才有的键": 42,
+        }
+        old_ask, old_ns = m.ask, m.new_session
+        m.ask = lambda *a, **k: dict(fake)
+        m.new_session = lambda *a, **k: "fake-sid"
+        try:
+            out = m.search("x")
+        finally:
+            m.ask, m.new_session = old_ask, old_ns
+        chk(out.get("text") == "T", f"{n}.search 保留 text")
+        chk(out.get("assets"), f"{n}.search 透传 assets（曾被丢）")
+        chk("brand_new" in (out.get("phases") or {}), f"{n}.search 透传 phases（曾被丢）")
+        chk(out.get("model") == "some-model", f"{n}.search 透传 model（曾被丢）")
+        chk("某个将来才有的键" in out, f"{n}.search 透传**未知**键（未来新增也不丢）")
+        chk(out.get("session_id") == "REAL-SID", f"{n}.search 用 provider 回写的 session_id")
+
     print("== 10. provider 列表与可用性 ==")
     chk(len(webai.names()) >= 4, "至少 4 家")
     chk(set(webai.names()) >= {"qwen", "deepseek", "stepfun", "glm"}, "四家齐全")

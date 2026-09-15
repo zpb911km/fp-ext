@@ -79,11 +79,56 @@ def _err(msg: str) -> dict:
             "raw_content": "", "success": False, "error": msg}
 
 
-def ask_llm(keywords: str, provider: str = "", think: bool = False) -> dict:
+def _available_models(name: str) -> list:
+    """列出某 provider 的可用模型 id。探测失败返回 []（不硬编名字）。"""
+    try:
+        ms = _webai.models(name) or []
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for m in ms:
+        mid = (m.get("id") or m.get("name")) if isinstance(m, dict) else m
+        if mid:
+            out.append(str(mid))
+    return out
+
+
+def _friendly_error(name: str, exc: Any, model: str = "") -> str:
+    """把裸露异常归类成可操作的提示（webai.classify + core.retry_hint）。"""
+    kind = _webai.classify(name, exc)
+    EK = _webai.core.ErrorKind
+
+    if kind == EK.AUTH:
+        # 凭据失效 → 不重试，指引刷新
+        return f"凭据失效，请重跑 {name}_login.py 刷新（{exc}）"
+
+    if kind == EK.QUOTA:
+        # 额度/频率用完 → 直说，别让调用方白重试
+        return f"{name} 额度/频率已用完，请勿重试，换一家 provider（{exc}）"
+
+    if kind == EK.UNSUPPORTED:
+        msg = f"{name} 不支持该请求"
+        if model:
+            msg += f"（模型「{model}」不可用）"
+            avail = _available_models(name)
+            if avail:  # models() 返回空就不列，别硬编
+                shown = ", ".join(avail[:20])
+                if len(avail) > 20:
+                    shown += f" …(共 {len(avail)} 个)"
+                msg += f"；可用模型: {shown}"
+        return f"{msg}（{exc}）"
+
+    # TRANSIENT / CONTENT_POLICY / UNKNOWN → 给通用动作建议
+    return f"{name} 调用失败（{kind.value}）：{exc}；建议：{_webai.core.retry_hint(kind)}"
+
+
+def ask_llm(keywords: str, provider: str = "", think: bool = False,
+            model: str = "") -> dict:
     """单轮联网提问。
 
     provider 留空则按 webai 的优先级自动挑（deepseek → qwen → glm → stepfun），
     跳过凭据未就绪的后端。
+    model 留空则用 provider 默认模型；不合法/不可用时会附上该家可用模型清单。
     返回 {answer, references, queries, raw_content, success, error}
     """
     if not _webai:
@@ -108,9 +153,9 @@ def ask_llm(keywords: str, provider: str = "", think: bool = False) -> dict:
         return _err(why)
 
     try:
-        r = p.search(keywords, think=think)
+        r = p.search(keywords, think=think, model=model)
     except Exception as e:  # noqa: BLE001
-        return _err(str(e))
+        return _err(_friendly_error(name, e, model))
 
     answer = (r.get("text") or "").strip()
     if not answer:
@@ -155,6 +200,10 @@ PLUGIN_DEFINITION = {
                     "type": "boolean",
                     "description": "深度思考模式，更慢但更准，默认 false",
                 },
+                "model": {
+                    "type": "string",
+                    "description": "指定模型（留空=用 provider 默认）。不同厂商可用模型不同，传了不可用的模型会返回该家可用清单。可先用 webai.models() 查询。",
+                },
             },
             "required": ["keywords"],
         },
@@ -171,9 +220,10 @@ async def execute(params: dict[str, Any]) -> str:
 
     provider = (params.get("provider") or "").strip()
     think = bool(params.get("think", False))
+    model = (params.get("model") or "").strip()
 
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, ask_llm, keywords, provider, think)
+    result = await loop.run_in_executor(None, ask_llm, keywords, provider, think, model)
 
     if not result.get("success"):
         return f"联网搜索失败: {result.get('error', '未知错误')}"
