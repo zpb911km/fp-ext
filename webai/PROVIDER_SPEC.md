@@ -208,6 +208,20 @@ PY
   交给 `login.py` 用**公共词表**（`core.AUTH_HINTS`）补一刀
   （provider 的局部 `classify()` 只认自家方言，认不出就回 `""`）。
 
+### ⚠️ 必须做负向测试（否则等于没测）
+
+**"凭据有效时返回 ok" 什么也证明不了** —— 一个游客也能访问的接口同样回 200。
+必须反过来测：把凭据换成垃圾，断言它报 `dead`。
+
+```bash
+cd <data>/public/webai && python3 tests/check_verify_live.py --yes
+```
+
+这条不是可选项。2026-09 就是这么抓到的：qwen 的 verify() 原本打 `/api/v2/models`，
+**游客可访问** → 凭据全坏也回 200 → verify() 永远报 ok → `--check` 形同虚设、
+AUTH 自愈永不触发。而当时"凭据正常 → 返回 ok"的测试**是绿的**。
+改用 `new_session()` 探针后四家都能识破坏凭据。
+
 `verify()` **不得**触发 `login.py`（会递归）。它只报告状态。
 
 ## 10. 凭据自愈（provider 不需要写任何代码）
