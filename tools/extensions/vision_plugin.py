@@ -75,7 +75,7 @@ def _vision_providers() -> list:
 def vision(
     image_path: str,
     query: str = "描述这张图片",
-    provider: str = "qwen",
+    provider: str = "",
     think: bool = False,
 ) -> str:
     """上传图片并提问，返回文本回答。
@@ -83,13 +83,18 @@ def vision(
     参数：
         image_path: 图像文件路径
         query:      询问文本
-        provider:   后端（默认 qwen）
+        provider:   后端；留空=自动（优先 deepseek，跳过凭据未就绪的）
         think:      深度思考模式（默认关闭；关闭时更快）
     """
     if not _webai:
         return "错误：webai 包缺失（<数据目录>/public/webai/）"
 
-    name = (provider or "qwen").lower()
+    name = (provider or "").strip().lower()
+    if name in ("", "auto"):
+        name, tried = _webai.first_available("vision")
+        if not name:
+            return "错误：没有可用的识图后端 —— " + "；".join(tried)
+
     try:
         p = _webai.get(name)
     except Exception as e:  # noqa: BLE001
@@ -146,7 +151,7 @@ PLUGIN_DEFINITION = {
                 "provider": {
                     "type": "string",
                     "enum": _vision_providers(),
-                    "description": "用哪个后端，默认 qwen。不同厂商识别能力有差异，可换着试",
+                    "description": "用哪个后端，留空=自动（优先 deepseek）。不同厂商识别能力有差异，可换着试",
                 },
             },
             "required": ["image_path"],
@@ -162,7 +167,7 @@ async def execute(params: dict[str, Any]) -> str:
     if not image_path:
         return "错误：需要 image_path 参数"
     query = (params.get("query") or "描述这张图片").strip()
-    provider = (params.get("provider") or "qwen").strip()
+    provider = (params.get("provider") or "").strip()
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, vision, image_path, query, provider)

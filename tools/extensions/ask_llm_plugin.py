@@ -79,15 +79,22 @@ def _err(msg: str) -> dict:
             "raw_content": "", "success": False, "error": msg}
 
 
-def ask_llm(keywords: str, provider: str = "qwen", think: bool = False) -> dict:
+def ask_llm(keywords: str, provider: str = "", think: bool = False) -> dict:
     """单轮联网提问。
 
+    provider 留空则按 webai 的优先级自动挑（deepseek → qwen → glm → stepfun），
+    跳过凭据未就绪的后端。
     返回 {answer, references, queries, raw_content, success, error}
     """
     if not _webai:
         return _err("webai 包缺失：<数据目录>/public/webai/")
 
-    name = (provider or "qwen").lower()
+    name = (provider or "").strip().lower()
+    if name in ("", "auto"):
+        name, tried = _webai.first_available("search")
+        if not name:
+            return _err("没有可用的联网后端 —— " + "；".join(tried))
+
     try:
         p = _webai.get(name)
     except Exception as e:  # noqa: BLE001
@@ -142,7 +149,7 @@ PLUGIN_DEFINITION = {
                 "provider": {
                     "type": "string",
                     "enum": _search_providers(),
-                    "description": "用哪个后端，默认 qwen。不同厂商检索覆盖不同，可换着问",
+                    "description": "用哪个后端，留空=自动（优先后端不可用时自动换）。不同厂商检索覆盖不同，可换着问。",
                 },
                 "think": {
                     "type": "boolean",
@@ -162,7 +169,7 @@ async def execute(params: dict[str, Any]) -> str:
     if not keywords:
         return "错误：需要 keywords 参数"
 
-    provider = (params.get("provider") or "qwen").strip()
+    provider = (params.get("provider") or "").strip()
     think = bool(params.get("think", False))
 
     loop = asyncio.get_running_loop()
@@ -177,7 +184,7 @@ async def execute(params: dict[str, Any]) -> str:
     used = result.get("provider", provider)
 
     lines = []
-    head = f"🔍 搜索结果 [{used}]"
+    head = f"🔍 搜索结果 [{used or '自动'}]"
     if queries:
         head += f"（查询: {' | '.join(queries)}）"
     lines.append(head + ":\n")

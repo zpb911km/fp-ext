@@ -58,6 +58,39 @@ def names() -> list:
     return list(_MODULES)
 
 
+# 默认优先级：deepseek 优先（默认不带思考，简单问答明显快），其余按注册序兜底。
+# 凭据未就绪的会被跳过 —— 避免"默认后端 token 一过期就整体不可用"。
+DEFAULT_ORDER = ("deepseek", "qwen", "glm", "stepfun")
+
+
+def first_available(capability: str = "", order=None):
+    """按优先级挑第一个可用 provider。
+
+    capability 非空时只考虑声明了该能力的后端，且会跳过凭据未就绪的。
+    返回 (name, tried) —— name 为空表示全都不可用，tried 是逐家原因（给人看）。
+    """
+    cands = [n for n in (order or DEFAULT_ORDER) if n in _MODULES]
+    cands += [n for n in _MODULES if n not in cands]
+    tried = []
+    for n in cands:
+        try:
+            mod = get(n)
+        except Exception as e:  # noqa: BLE001
+            tried.append(f"{n}:加载失败({type(e).__name__})")
+            continue
+        if capability and capability not in getattr(mod, "capabilities", set()):
+            tried.append(f"{n}:无 {capability} 能力")
+            continue
+        try:
+            ok, why = mod.available()
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, f"{type(e).__name__}: {e}"[:80]
+        if ok:
+            return n, tried
+        tried.append(f"{n}:{why}")
+    return "", tried
+
+
 def available() -> dict:
     """{provider: (是否可用, 原因)} —— 用于给用户提示"该配哪个凭据" """
     out = {}
