@@ -564,6 +564,12 @@ AUTH_HINTS = (
     "unauthorized", "401", "403", "forbidden", "invalid token", "token expired",
     "token invalid", "not logged in", "未登录", "登录失效", "登录已过期", "请重新登录",
     "credentials", "cookie expired", "no cookie", "sign expired", "签名",
+    # 实测补充：qwen 过期时回的是 "Token has expired, please log in again."
+    # —— 原表只有 "token expired"（词序不同）匹配不到，导致凭据失效被归成 unknown，
+    #    既给不出"重跑登录脚本"的提示，也让 auto-heal 永远不会触发。
+    "has expired", "expired", "please log in", "log in again", "login again",
+    "please login", "session expired", "凭据过期", "凭据已过期", "令牌过期",
+    "需要登录", "请登录", "重新登陆",
 )
 
 QUOTA_HINTS = (

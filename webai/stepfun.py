@@ -470,3 +470,25 @@ def classify(text: str = "", status: int = 0, raw=None, exc=None, **_) -> str:
 # 8. 新增可选钩子（PROVIDER_SPEC.md）：CAPABILITY_MAP={} / models()->[] /
 #    probe()->supported=None（诚实）/ classify() 收「换个话题聊聊」=content_policy、
 #    cookie 失效=auth；不定义 poll()（无异步任务）。ask() 签名与老 key 一字未改。
+
+
+# ── 凭据自检（login.py 的 --check / 静默刷新后校验用）─────────────
+
+def verify() -> tuple:
+    """轻量探测：凭据是否被服务端认可。→ ("ok","") / ("dead",why) / ("unknown",why)
+
+    用 new_session() 做探针 —— 它是真实的鉴权调用（对比：qwen/glm 用只读 GET）。
+    代价是会在服务端留下一个空会话，但比"探测端点猜错"可靠。
+    非 AUTH 类的失败一律 unknown → 不触发自动登录（宁可漏刷，不可误刷）。
+    """
+    try:
+        new_session()
+    except Exception as e:  # noqa: BLE001
+        try:
+            kind = str(classify(exc=e, text=str(e)) or "")
+        except Exception:  # noqa: BLE001
+            kind = ""
+        if "auth" in kind.lower():
+            return "dead", f"{type(e).__name__}: {e}"
+        return "unknown", f"{type(e).__name__}: {e}"
+    return "ok", ""

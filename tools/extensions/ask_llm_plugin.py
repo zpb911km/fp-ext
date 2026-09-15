@@ -97,14 +97,28 @@ def _available_models(name: str) -> list:
     return out
 
 
+def _login_cmd(*args: str) -> str:
+    """给用户的"复制即用"命令 —— 统一入口，不必记四个 *_login.py 的名字。"""
+    try:
+        from fp_core.platform_utils import get_data_dir
+        p = Path(str(get_data_dir())) / "public" / "webai" / "login.py"
+    except Exception:  # noqa: BLE001
+        p = Path(os.path.expanduser("~/.local/share/fp/public/webai/login.py"))
+    tail = (" " + " ".join(args)) if args else ""
+    return f"python3 {p}{tail}"
+
+
 def _friendly_error(name: str, exc: Any, model: str = "") -> str:
     """把裸露异常归类成可操作的提示（webai.classify + core.retry_hint）。"""
     kind = _webai.classify(name, exc)
     EK = _webai.core.ErrorKind
 
     if kind == EK.AUTH:
-        # 凭据失效 → 不重试，指引刷新
-        return f"凭据失效，请重跑 {name}_login.py 刷新（{exc}）"
+        # 凭据失效 → 不重试，给一条复制即用的刷新命令
+        return (f"凭据失效：{exc}\n"
+                f"  已自动尝试过静默刷新；仍报此错说明需要人工登录。\n"
+                f"  刷新它：{_login_cmd(name)}\n"
+                f"  查全部：{_login_cmd('--check')}")
 
     if kind == EK.QUOTA:
         # 额度/频率用完 → 直说，别让调用方白重试

@@ -64,6 +64,7 @@ provider 契约
     if r.status == "job": j = webai.poll("qwen", r.job)
 """
 
+import functools
 import importlib
 import os
 import time
@@ -74,7 +75,7 @@ from .core import Asset, ErrorKind, Job, Reply, WebAIError
 
 __all__ = [
     "core", "Asset", "Job", "Reply", "ErrorKind", "WebAIError",
-    "get", "names", "available", "capabilities", "has", "models", "probe",
+    "get", "raw", "names", "available", "capabilities", "has", "models", "probe",
     "first_available", "classify", "new_session", "ask", "poll", "upload",
     "capability_map", "resolve_capability",
     "search", "asset_dir", "DEFAULT_ORDER",
@@ -89,17 +90,104 @@ _MODULES = {
 
 _cache = {}
 
+# 会打到服务端、可能因凭据过期而失败的方法 —— 只给这几个挂自愈。
+# 命名刻意收窄：available()/models()/probe() 等"查状态"的方法**不**触发登录。
+_HEAL_METHODS = ("ask", "search", "upload", "poll")
+
+# 自愈的开关：设 FP_WEBAI_NO_AUTOLOGIN=1 可完全关掉（例如不想在失败时多花 45s）
+_ENV_OFF = "FP_WEBAI_NO_AUTOLOGIN"
+
+
+def _is_auth_error(name: str, exc: BaseException) -> bool:
+    try:
+        return classify(name, exc) == ErrorKind.AUTH
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _heal(name: str) -> bool:
+    """静默刷新凭据（headless / 不等人 / 硬超时 / 子进程隔离）。
+
+    刻意吞掉所有异常：自愈是**尽力而为**，失败时应当让原始异常照常抛出，
+    而不是把"刷新失败"变成新的错误类型。
+    """
+    if os.environ.get(_ENV_OFF):
+        return False
+    try:
+        from .login import silent_refresh      # 延迟 import：避免 provider ↔ login 循环依赖
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return bool(silent_refresh(name))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _wrap_heal(name, fn):
+    """AUTH 错误 → 静默刷新一次 → 重试一次（**只重试一次**，避免打转）。"""
+
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:  # noqa: BLE001
+            if _is_auth_error(name, e) and _heal(name):
+                return fn(*a, **kw)
+            raise
+
+    return wrapper
+
+
+class _HealingProvider:
+    """provider 模块的透明包装：AUTH 失败时静默刷新 + 重试一次。
+
+    其余属性**原样转发**，所以它仍然"长得像"那个模块
+    （capabilities / models / available / 常量都能取到）。
+
+    为什么包在 get()：这是所有调用方的**唯一入口** ——
+    一处生效 = 三个工具 + webai.ask/search 全被覆盖，不必改四个 provider。
+    """
+
+    __slots__ = ("_name", "_mod")
+
+    def __init__(self, name, mod):
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_mod", mod)
+
+    def __getattr__(self, k):
+        v = getattr(object.__getattribute__(self, "_mod"), k)
+        if k in _HEAL_METHODS and callable(v):
+            return _wrap_heal(object.__getattribute__(self, "_name"), v)
+        return v
+
+    def __setattr__(self, k, v):
+        setattr(object.__getattribute__(self, "_mod"), k, v)
+
+    def __repr__(self):
+        return f"<webai provider '{object.__getattribute__(self, '_name')}'>"
+
+
+def raw(name: str):
+    """未包装的原始 provider 模块（调试 / 测试 / 需要绕开自愈时用）。"""
+    name = (name or "").lower()
+    if name not in _MODULES:
+        raise KeyError(f"未知 provider: {name}（可用: {', '.join(_MODULES)}）")
+    return importlib.import_module(f".{_MODULES[name]}", __package__)
+
 
 def get(name: str):
-    """取得 provider。延迟 import —— 某个后端依赖缺失时不影响其他后端。"""
+    """取得 provider（带凭据自愈的包装）。
+
+    延迟 import —— 某个后端依赖缺失时不影响其他后端。
+    """
     name = (name or "").lower()
     if name in _cache:
         return _cache[name]
     if name not in _MODULES:
         raise KeyError(f"未知 provider: {name}（可用: {', '.join(_MODULES)}）")
     mod = importlib.import_module(f".{_MODULES[name]}", __package__)
-    _cache[name] = mod
-    return mod
+    _cache[name] = _HealingProvider(name, mod)
+    return _cache[name]
 
 
 def names() -> list:

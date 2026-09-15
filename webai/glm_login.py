@@ -2,15 +2,20 @@
 """GLM（智谱清言 chatglm.cn）登录器 —— 打开浏览器让你登录，凭据自动落盘。
 
 用法：
-    python3 <fp数据目录>/public/webai/glm_login.py
-
+    python3 <fp数据目录>/public/webai/glm_login.py                  # 有头，需要时等你登录
+    python3 <fp数据目录>/public/webai/glm_login.py --headless --wait 0
+                                                                    # 静默：只试 profile 复用，不等人
 产出：
     <数据目录>/glm/profile      持久化浏览器 profile（登录一次可复用）
     <数据目录>/glm/cookies.json {cookies: {...}, device_id: "..."}
 
 登录方式：手机号 / 微信扫码（页面上用哪个都行）。
 凭据在 cookie 里：chatglm_token(Bearer) / chatglm_refresh_token / chatglm_user_id。
+
+返回码：0=已登录并落盘 / 2=未检测到登录（静默模式，未等人工）/ 1=出错
+（统一入口见同目录 login.py —— 一般不用直接跑本脚本）
 """
+import argparse
 import json
 import pathlib
 import sys
@@ -29,6 +34,7 @@ ROOT = DATA / "glm"
 PROFILE = ROOT / "profile"
 CRED_FILE = ROOT / "cookies.json"
 WAIT_SECONDS = 600
+SILENT_SECONDS = 12
 BASE = "https://chatglm.cn"
 
 
@@ -44,11 +50,12 @@ def read_creds(ctx) -> dict:
     return jar
 
 
-def main() -> int:
+def main(headless: bool = False, wait_seconds: int = WAIT_SECONDS) -> int:
+    silent = wait_seconds <= 0
     PROFILE.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
-            str(PROFILE), headless=False,
+            str(PROFILE), headless=headless,
             args=["--disable-blink-features=AutomationControlled"],
             viewport={"width": 1300, "height": 880},
         )
@@ -56,26 +63,28 @@ def main() -> int:
         page.goto(f"{BASE}/", wait_until="domcontentloaded")
         page.wait_for_timeout(4000)
 
-        jar = read_creds(ctx)
-        if jar:
-            print(f"✅ 已是登录态（profile 复用成功），cookie {len(jar)} 项")
-        else:
+        if not silent:
             print("请在打开的浏览器里登录智谱清言（手机号 / 微信扫码均可）…")
-            print(f"最多等待 {WAIT_SECONDS} 秒。")
-            deadline = time.time() + WAIT_SECONDS
-            while time.time() < deadline:
-                jar = read_creds(ctx)
-                if jar:
-                    print(f"\n✅ 登录成功，cookie {len(jar)} 项")
-                    break
-                if page.is_closed():
-                    print("\n❌ 浏览器被关闭，未完成登录")
-                    return 1
-                time.sleep(3)
-            if not jar:
-                print("\n❌ 超时未检测到登录")
-                ctx.close()
+            print(f"最多等待 {wait_seconds} 秒。")
+
+        limit = SILENT_SECONDS if silent else wait_seconds
+        deadline = time.time() + limit
+        jar = read_creds(ctx)
+        while not jar and time.time() < deadline:
+            if page.is_closed():
+                print("❌ 浏览器被关闭，未完成登录")
                 return 1
+            time.sleep(3)
+            jar = read_creds(ctx)
+
+        if not jar:
+            print("❌ 静默模式：profile 里没有有效登录态（需要人工登录）" if silent
+                  else "❌ 超时未检测到登录")
+            ctx.close()
+            return 2 if silent else 1
+
+        print(f"✅ 已登录，cookie {len(jar)} 项"
+              + ("（profile 复用成功）" if not silent else ""))
 
         # device_id：沿用已存的，没有就生成一个（服务端只要求存在且稳定）
         old = {}
@@ -95,4 +104,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    ap = argparse.ArgumentParser(description="GLM 登录器")
+    ap.add_argument("--headless", action="store_true", help="无头模式（静默刷新用）")
+    ap.add_argument("--wait", type=int, default=WAIT_SECONDS,
+                    help="等待人工登录的秒数；0=不等待（静默尝试）")
+    a = ap.parse_args()
+    sys.exit(main(headless=a.headless, wait_seconds=a.wait))

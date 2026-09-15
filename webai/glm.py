@@ -849,3 +849,24 @@ def upload(path: str) -> dict:
 # 7. 可选钩子（PROVIDER_SPEC.md）：CAPABILITY_MAP 用 assistant_id（非 chat_type）；
 #    models() 走 available_models 配置、probe() 走 recent_list 助手清单、classify() 只认
 #    40014→auth / 「权限不足」→unsupported（其余回 "" 交通用词表）。GLM 全同步 → **不实现 poll()**。
+
+
+# ── 凭据自检（login.py 的 --check / 静默刷新后校验用）─────────────
+
+def verify() -> tuple:
+    """轻量探测：凭据是否被服务端认可。→ ("ok","") / ("dead",why) / ("unknown",why)
+
+    注意 **不能用 new_session()** —— GLM 没有建会话 API（返回占位符 "new"，不发请求）。
+    这里用 ``available_models`` 配置接口（与 models() 同源）。
+    ⚠️ 该端点是否需要鉴权未联网验证；拿不准一律 unknown（不触发自动登录）。
+    """
+    try:
+        r = _session().get(MODELS_URL, headers=_headers(),
+                           params={"tag": "available_models"}, timeout=20)
+    except Exception as e:  # noqa: BLE001
+        return "unknown", f"网络/请求异常：{type(e).__name__}: {e}"
+    if r.status_code == 200:
+        return "ok", ""
+    if r.status_code in (401, 403):
+        return "dead", f"HTTP {r.status_code}（凭据被拒）"
+    return "unknown", f"HTTP {r.status_code}: {(r.text or '')[:160]}"

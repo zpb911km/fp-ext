@@ -807,3 +807,25 @@ def poll(job) -> dict:
     if content:
         out["assets"] = [{"kind": _kind_for_chat_type(ctype, content), "url": content}]
     return out
+
+
+# ── 凭据自检（login.py 的 --check / 静默刷新后校验用）─────────────
+
+def verify() -> tuple:
+    """轻量探测：凭据是否被服务端认可。→ ("ok","") / ("dead",why) / ("unknown",why)
+
+    ⚠️ 本机未联网验证过该端点是否需要鉴权 —— 属"尽力而为"。拿不准一律 ``unknown``：
+    调用方约定 unknown **不触发**自动登录（宁可漏刷，不可误刷）。
+    """
+    try:
+        r = _session().get(f"{API_BASE}/api/v2/models", headers=_headers(), timeout=20)
+    except Exception as e:  # noqa: BLE001
+        return "unknown", f"网络/请求异常：{type(e).__name__}: {e}"
+    if r.status_code == 200:
+        return "ok", ""
+    if r.status_code in (401, 403):
+        return "dead", f"HTTP {r.status_code}（凭据被拒）"
+    body = (r.text or "")[:160]
+    if "<html" in body.lower():
+        return "unknown", "被 WAF 拦成挑战页（无法判断凭据）"
+    return "unknown", f"HTTP {r.status_code}: {body}"

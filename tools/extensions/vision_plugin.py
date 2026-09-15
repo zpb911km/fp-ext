@@ -80,16 +80,29 @@ def _vision_providers() -> list:
 # ── 错误友好化 ──────────────────────────────────────────────────
 # provider 抛上来的异常是"裸露"的（HTTP 代码 / 服务端原话）。这里统一过一遍
 # webai 的错误归类层，翻成用户能照着做的提示：
-#   AUTH  → 重跑对应 <provider>_login.py 刷新凭据（重试无用）
+#   AUTH  → 给一条复制即用的统一刷新命令（provider 层已试过静默刷新）
 #   QUOTA → 明说额度/频率用完（重试无用，该换一家）
 # 其余类别沿用 core.retry_hint() 的统一建议。归类本身失败时退回原始异常，不吞信息。
+
+def _login_cmd(*args: str) -> str:
+    """给用户的"复制即用"命令 —— 统一入口，不必记四个 *_login.py 的名字。"""
+    try:
+        from fp_core.platform_utils import get_data_dir
+        p = Path(str(get_data_dir())) / "public" / "webai" / "login.py"
+    except Exception:  # noqa: BLE001
+        p = Path(os.path.expanduser("~/.local/share/fp/public/webai/login.py"))
+    tail = (" " + " ".join(args)) if args else ""
+    return f"python3 {p}{tail}"
+
 
 def _friendly_error(name: str, stage: str, exc: BaseException) -> str:
     try:
         kind = _webai.classify(name, exc)
         tag = getattr(kind, "value", str(kind))
         if tag == "auth":
-            advice = f"凭据已失效 —— 请重跑 {name}_login.py 刷新后重试"
+            advice = (f"凭据已失效（已自动试过静默刷新，仍失败说明需要人工登录）。\n"
+                      f"  刷新它：{_login_cmd(name)}\n"
+                      f"  查全部：{_login_cmd('--check')}")
         elif tag == "quota":
             advice = f"{name} 的额度/频率已用完 —— 现在重试无用，请换一家 provider"
         else:

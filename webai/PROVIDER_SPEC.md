@@ -180,3 +180,46 @@ PY
 断言 `phases` 里有它；构造一个 `image_gen` 帧，断言 `assets` 里有图。
 
 最后必须跑一次**语法与导入检查**，并确认 `pkg.available()` 四家都不报错。
+
+---
+
+## 9. `verify() -> tuple[str, str]`（凭据自检）
+
+给统一入口 `login.py`（`--check` / 静默刷新后的确认）用：判断**凭据是否被服务端认可**。
+
+返回三态之一：
+
+| 返回 | 含义 | 调用方动作 |
+|---|---|---|
+| `("ok", "")` | 服务端认可 | 无 |
+| `("dead", why)` | 服务端**明确**拒绝（401/403 / 明确的鉴权文案） | 需要刷新凭据 |
+| `("unknown", why)` | 网络不通 / 端点不确定 / 认不出来 | **不刷新** |
+
+**铁律：拿不准一律 `unknown`。** 把网络抖动报成 `dead`，会导致每次抖动都去弹一次浏览器登录 ——
+比漏刷糟糕得多。只有"确实是鉴权被拒"才回 `dead`。
+
+实现经验：
+
+* **有只读接口的后端**（qwen / glm）→ 打一个**需要鉴权**的只读 GET，按 HTTP 状态码判。
+  ⚠️ 别用游客也能访问的配置类接口（如 `config/operation_data` / `configs/`）——
+  它们 200 不代表登录有效（实测：未登录也能拿到数据）。
+* **其余**（deepseek / stepfun）→ 用真实的鉴权调用做探针（`new_session()`）。
+  代价是服务端会多一个空会话，但比猜端点可靠。异常文本不在 provider 内判死，
+  交给 `login.py` 用**公共词表**（`core.AUTH_HINTS`）补一刀
+  （provider 的局部 `classify()` 只认自家方言，认不出就回 `""`）。
+
+`verify()` **不得**触发 `login.py`（会递归）。它只报告状态。
+
+## 10. 凭据自愈（provider 不需要写任何代码）
+
+`webai.get()` 返回的是 `_HealingProvider` 包装：`ask / search / upload / poll` 抛出的异常
+若被 `classify()` 判为 `AUTH`，会先调 `login.silent_refresh()`（headless、不等人、
+子进程 + 硬超时 + 并发锁），成功则**重试一次**，失败则原样抛出。
+
+因此新增 provider **无需**处理登录 —— 只要：
+
+1. `available()` 诚实报告本地有没有凭据；
+2. `classify()` 认得自家的鉴权方言（其余交给公共词表）；
+3. 提供 `verify()`。
+
+关掉自愈：`FP_WEBAI_NO_AUTOLOGIN=1`。
