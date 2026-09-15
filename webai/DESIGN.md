@@ -199,17 +199,29 @@ class Reply:            # 同步返回
     meta: dict          # ← provider 的 extra 原文，原样透传，不做解释
 ```
 
-### 5.3 接口（5 个动词封顶）
+### 5.3 接口（**4 个动词** —— 原写"5 个"，实测后 `run()` 被删掉）
 
 ```python
-def ask(text, *, session, files, model, **opts) -> Reply
-def run(task: str, inputs: dict, *, model, **opts) -> Job | Reply   # task 是开放字符串
+def new_session(capability="", model="") -> str   # ⚠️ 能力是**会话级**属性
+def ask(session_id, text, *, files, model, **opts) -> Reply | Job
 def poll(job) -> Job
-def models() -> list[ModelInfo]                 # 运行时枚举
-def probe(capability) -> CapabilityInfo         # 运行时探测
+def models() -> list[ModelInfo]                   # 运行时枚举，拿不到就 []
+def probe(capability) -> CapabilityInfo           # 尽力而为，允许 supported=None
 ```
 
-`task` 为**开放字符串** —— 无限性只有一个入口，而不是 N 个 if 分支。
+**修订记录（为什么少了一个）**：
+
+1. **`run(task, inputs)` 删掉。** 原设计假设"生成类调用"和"聊天"结构不同。实测三家生成能力
+   （Qwen `t2i`/`t2v`、GLM 生图）**输入都是文本、返回都是"一条带资产的消息"**，走的还是 chat 端点。
+   所以能力是 `ask()` 的**参数**，不是独立动词。
+2. **能力被提到 `new_session()` 上。** 实测 `chat_type` 在 `POST /api/v2/chats/new` 时就定了，
+   不是每条消息能切 —— 能力是**会话级属性**。
+3. **`run()` 若存在，会是个"会做错产品决策的 helper"**：`slides` / `deep_research` 实测会追问
+   （幻灯片给 3 个受众方向 × 3 种风格让选），自动发"确认"等于替用户锁死默认值。
+
+**能力名是开放字符串**：`t2i` / `image_gen` / `cogview` 都合法。
+跨家匹配靠 `core.CAPABILITY_ALIASES` 折叠成通用名（**只用于路由，不用于调用**）；
+发起调用时一律用**这家自己的键**（`resolve_capability()` 负责翻译）。
 
 ### 5.4 错误归一化（客户端不要建模限额）
 

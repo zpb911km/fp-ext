@@ -23,9 +23,18 @@ import pathlib
 
 import requests
 
+try:                                    # provider → core 是允许的方向（core.py 顶部声明）
+    from . import core as _core
+except Exception:                       # noqa: BLE001  被当独立模块加载时降级
+    _core = None
+
 name = "stepfun"
 capabilities = {"chat", "search", "vision"}
 default_model = "step-auto"
+
+# ── 新契约（可选钩子，见 PROVIDER_SPEC.md §1）────────────────────
+# 无生成类能力：stepfun 的产物里没有「能力名 → 请求参数」的方言可声明，诚实留空。
+CAPABILITY_MAP: dict = {}
 
 BASE = "https://chat.stepfun.com"
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -141,7 +150,8 @@ def iter_envelopes(raw: bytes):
 
 # ── 会话 ────────────────────────────────────────────────────────
 
-def new_session(model: str = "") -> str:
+def new_session(model: str = "", capability: str = "", **dialect) -> str:
+    """建会话。CAPABILITY_MAP 为空 → capability / dialect 一律忽略（绝不抛异常）。"""
     r = _session().post(f"{BASE}{SVC}/CreateChatSession",
                         headers=_headers(), json={}, timeout=_HTTP_TIMEOUT)
     _check(r)
@@ -156,7 +166,11 @@ def ask(session_id: str, text: str, *, parent_message_id=None, model: str = "",
         think: bool = False, search: bool = False, files=None) -> dict:
     """发消息并收完整流。parent_message_id 被忽略（服务端自持上下文）。
 
-    返回 {text, thinking, message_id, references, queries}
+    返回 dict：
+      老 key（原样保留）: text / thinking / message_id / references / queries
+      新 key（可选，见 PROVIDER_SPEC §2）: assets / model / phases / extra
+        * phases: 本次出现过的**每一个** event 类型（含未知）→ 累计文本（无文本记 ""）
+        * extra : 原始事件全量留档 + 非 event 信封 + 未解析帧 —— 未知的东西不能丢
     """
     body = {
         "message": {
@@ -189,36 +203,141 @@ def ask(session_id: str, text: str, *, parent_message_id=None, model: str = "",
 
 
 def _parse(raw: bytes) -> dict:
-    text, think, refs, queries = [], [], [], []
+    """解析 Connect 信封流 → 结果 dict。
+
+    两条原则（PROVIDER_SPEC §2）：
+      * 老 key（text/thinking/message_id/references/queries）行为**一字不变**；
+      * **任何消息类型都不丢**：每个 event 名称都进 ``phases``，原始事件全量留档在
+        ``extra["events"]``，非 event 信封进 ``extra["envelopes"]``，解析不出的帧进
+        ``extra["unparsed_frames"]``。
+        （注：这是"protobuf 帧解析处"在本家对应的落点 —— stepfun 实际走 Connect-JSON
+        信封而非 protobuf，但"未知类型不能丢"的要求完全一致。）
+    """
+    text, think, refs = [], [], []
+    queries: list = []
     msg_id = None
-    for flags, o in iter_envelopes(raw):
-        if flags == 2 or not o:  # 0x02 = end-of-stream
+    model = ""
+    phases: dict = {}          # event 名 → 累计文本（无文本的记 ""，表明"出现过"）
+    raw_events: list = []      # 每个 event 原样留档（含未知类型）
+    assets: list = []
+    extra: dict = {}
+
+    for i, (flags, o) in enumerate(iter_envelopes(raw)):
+        if flags == 2:                      # 0x02 = end-of-stream trailer
+            extra.setdefault("trailers", []).append(o)
             continue
-        ev = (o.get("data") or {}).get("event") or {}
-        if "startEvent" in ev:
-            msg_id = ev["startEvent"].get("messageId") or msg_id
-        elif "reasoningEvent" in ev:
-            think.append(ev["reasoningEvent"].get("text") or "")
-        elif "textEvent" in ev:
-            text.append(ev["textEvent"].get("text") or "")
-        elif "messageEvent" in ev:
-            m = ev["messageEvent"].get("message") or {}
-            msg_id = m.get("messageId") or msg_id
-        elif "pipelineEvent" in ev:
-            pe = ev["pipelineEvent"]
-            es = pe.get("eventSearch") or {}
-            for r0 in es.get("results") or es.get("searchResults") or []:
-                if isinstance(r0, dict) and (r0.get("url") or r0.get("title")):
-                    refs.append({"url": r0.get("url", ""), "title": r0.get("title", ""),
-                                 "snippet": r0.get("snippet") or r0.get("content") or ""})
-            # 注意：SEARCH 的 pipelineEvent.title 是「来源」，不是检索词 —— 别当 query 用
+        if o is None:                       # 有帧但 JSON 解不开 —— 只记存在，不猜内容
+            extra.setdefault("unparsed_frames", []).append({"index": i, "flags": flags})
+            continue
+        data = o.get("data") if isinstance(o, dict) else None
+        ev = (data or {}).get("event") if isinstance(data, dict) else None
+        if not isinstance(ev, dict) or not ev:
+            # 不是 event 信封（error / metadata / 未知结构）→ 原样留，绝不丢
+            extra.setdefault("envelopes", []).append(o)
+            continue
+
+        for ev_name, body in ev.items():
+            # ① 先登记 + 原样留档（认不认识都留）—— 未知消息类型不能丢
+            phases.setdefault(ev_name, "")
+            raw_events.append({"index": i, "event": ev_name, "body": body})
+            if not isinstance(body, dict):
+                continue
+
+            # ② 已知语义解析（老行为保持不变）
+            if ev_name == "startEvent":
+                msg_id = body.get("messageId") or msg_id
+            elif ev_name == "reasoningEvent":
+                t = body.get("text") or ""
+                think.append(t)
+                phases[ev_name] += t
+            elif ev_name == "textEvent":
+                t = body.get("text") or ""
+                text.append(t)
+                phases[ev_name] += t
+            elif ev_name == "messageEvent":
+                m = body.get("message") or {}
+                if isinstance(m, dict):
+                    msg_id = m.get("messageId") or msg_id
+                    model = m.get("model") or model
+                    meta = m.get("meta")
+                    trace = meta.get("traceId") if isinstance(meta, dict) else None
+                    if trace:
+                        extra.setdefault("trace_id", trace)
+            elif ev_name == "pipelineEvent":
+                _collect_refs(body, refs)
+                # pipelineEvent.type ∈ REASONING / SEARCH —— 本家最像"phase"的东西
+                ptype = body.get("type")
+                if ptype:
+                    phases.setdefault(f"pipeline:{ptype}", "")
+
+            # ③ 产物：尽力提取（有就填；认不出绝不假造）
+            assets.extend(_harvest_assets(body))
+
+    if raw_events:
+        extra.setdefault("events", raw_events)
+
     return {
+        # 老 key —— 原样保留
         "text": "".join(text),
         "thinking": "".join(think),
         "message_id": msg_id,
         "references": refs,
         "queries": queries,
+        # 新 key —— 有则更富，缺了不影响
+        "assets": assets,
+        "model": model,
+        "phases": phases,
+        "extra": extra,
     }
+
+
+def _collect_refs(pe: dict, refs: list) -> None:
+    """从 pipelineEvent 抽搜索引用（老逻辑原样保留）。
+
+    注意：SEARCH 的 pipelineEvent.title 是「来源」，不是检索词 —— 别当 query 用。
+    """
+    es = pe.get("eventSearch") or {}
+    for r0 in es.get("results") or es.get("searchResults") or []:
+        if isinstance(r0, dict) and (r0.get("url") or r0.get("title")):
+            refs.append({"url": r0.get("url", ""), "title": r0.get("title", ""),
+                         "snippet": r0.get("snippet") or r0.get("content") or ""})
+
+
+# 产物线索（best-effort）：stepfun 目前**未观测到**独立产物事件（SPEC 表：暂无），
+# 下面只做保守提取 —— 只认「明确的产物键 + URL」，认不出绝不假造（宁缺勿假）。
+# 已知的非产物 URL 键（如搜索结果的 favicon）显式排除。
+_ASSET_KIND_BY_KEY = {
+    "imageurl": "image", "image": "image", "images": "image",
+    "videourl": "video", "video": "video", "videos": "video",
+    "audiourl": "audio", "audio": "audio",
+    "fileurl": "file", "file": "file", "files": "file", "resource": "file",
+    "pdfurl": "pdf", "pdf": "pdf",
+}
+_SKIP_URL_KEYS = {"faviconurl", "avatar", "icon", "iconurl", "thumbnailurl"}
+
+
+def _harvest_assets(body) -> list:
+    """从事件体里尽力找出 URL 型产物（深度遍历，带 kind 上下文继承）。"""
+    out: list = []
+    stack = [(body, None)]
+    while stack:
+        node, hint = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                kl = str(k).lower()
+                if kl in _SKIP_URL_KEYS:
+                    continue
+                kind = _ASSET_KIND_BY_KEY.get(kl) or hint
+                if isinstance(v, str):
+                    if kind and v.startswith(("http://", "https://")):
+                        out.append({"kind": kind, "url": v})
+                elif isinstance(v, list):
+                    stack.extend((it, kind) for it in v)
+                elif isinstance(v, dict):
+                    stack.append((v, kind))
+        elif isinstance(node, list):
+            stack.extend((it, hint) for it in node)
+    return out
 
 
 # ── 便捷：一次性联网搜索 ────────────────────────────────────────
@@ -226,13 +345,17 @@ def _parse(raw: bytes) -> dict:
 def search(query: str, *, think: bool = False, model: str = "") -> dict:
     sid = new_session(model)
     r = ask(sid, query, model=model, think=think, search=True)
-    return {
+    out = {
         "text": r["text"],
         "references": r["references"],
         "queries": r["queries"],
         "session_id": sid,
         "message_id": r["message_id"],
     }
+    for k in ("assets", "model", "phases", "extra"):   # 顺手透传新键（老 key 不变）
+        if k in r:
+            out[k] = r[k]
+    return out
 
 
 # ── 上传 ────────────────────────────────────────────────────────
@@ -275,6 +398,52 @@ def upload(path: str) -> dict:
             "url": js.get("url", ""), "meta": js.get("meta") or {}, "mime": mime}
 
 
+# ── 新契约：模型枚举 / 能力探测 / 错误归类（PROVIDER_SPEC §3/§4/§6）──
+
+def models() -> list:
+    """枚举可选模型。stepfun **没有模型清单接口** → 诚实返回空（别硬编可能过期的名字）。"""
+    return []
+
+
+def probe(capability: str = "") -> dict:
+    """尽力探测能力。stepfun 无配置/清单接口，只能在真实调用时观察 → 诚实返回 None。"""
+    return {
+        "supported": None,
+        "via": "none",
+        "note": "stepfun 无模型清单/能力探测接口；是否支持某能力只能真实调用观察，故不猜。",
+    }
+
+
+# stepfun 服务端文案方言（实测）
+_AUTH_DIALECT = (
+    "embezzled", "unauthenticated", "oasis-token", "鉴权失败",
+    "cookie 失效", "cookie失效", "cookie 过期", "cookie过期",
+    "登录已失效", "凭据失效",
+)
+# 「换个话题聊聊」= 模型自己回避了敏感内容，**不是技术缺陷** → content_policy
+_POLICY_DIALECT = ("换个话题聊聊", "换个话题", "换一个话题", "聊点别的", "聊聊别的")
+
+
+def classify(text: str = "", status: int = 0, raw=None, exc=None, **_) -> str:
+    """stepfun 方言优先，其余交给 core.classify_text（通用中英文词表）。
+
+    方言来历（实测）：
+      * cookie / Oasis-Token 失效（401 `oasis-token is embezzled`）→ auth
+      * 模型回「换个话题聊聊」→ 它自己回避了敏感内容（非技术故障）→ content_policy
+    """
+    if isinstance(exc, AuthError):
+        return "auth"
+    blob = text or ""
+    low = blob.lower()
+    if any(h.lower() in low for h in _AUTH_DIALECT):
+        return "auth"
+    if any(h in blob for h in _POLICY_DIALECT):
+        return "content_policy"
+    if _core is not None:
+        return _core.classify_text(blob, status=status).value
+    return ""      # 拿不到 core → 交上层 __init__.classify 兜底（假值即触发回退）
+
+
 # ═════════════════════════════════════════════════════════════════
 # 踩坑记录（实测）
 # ═════════════════════════════════════════════════════════════════
@@ -297,3 +466,12 @@ def upload(path: str) -> dict:
 #
 # 6. 搜索引用在 `pipelineEvent.eventSearch.results`（action=EVENT_ACTION_END），
 #    字段 url/title/snippet/site/faviconUrl。pipeline 的 title 是「来源」不是检索词。
+
+# 7. 【协议澄清】本实现走的是 **Connect-JSON 信封流（HTTP ChatStream）**，
+#    不是 WebSocket + protobuf。页面上的 wss://.../botapi/wss/connection（带 protobuf 帧）
+#    只是心跳/部署状态通道，正文一律走 HTTP。所谓"protobuf 帧解析处"在本家的落点是
+#    iter_envelopes() / _parse() —— 未知 event 类型必须登记进 phases/extra，绝不丢。
+#
+# 8. 新增可选钩子（PROVIDER_SPEC.md）：CAPABILITY_MAP={} / models()->[] /
+#    probe()->supported=None（诚实）/ classify() 收「换个话题聊聊」=content_policy、
+#    cookie 失效=auth；不定义 poll()（无异步任务）。ask() 签名与老 key 一字未改。

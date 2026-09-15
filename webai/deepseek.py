@@ -15,6 +15,10 @@ chat / search / vision 同样共用一个 completion 端点：
     ⚠️ 不能见 "FINISHED" 就断流 —— response/search_status 也会回 FINISHED，
        开搜索时会提前退出、正文全丢；只认 response/status。
 
+可选钩子（PROVIDER_SPEC.md）：CAPABILITY_MAP={}（无生成类能力）、models()=[]（无公开枚举
+接口，诚实返回空）、probe() 一律 supported=None、classify() 认本家方言 rate_limit_reached→quota；
+无异步任务故不实现 poll()。SSE 解析把出现过的每个通道收进 phases —— 未知 phase/event 不丢。
+
 凭据：~/.deepseek_token（来自浏览器 localStorage userToken.value）。
 刷新：运行 deepseek_login.py 走一次 Playwright 登录。
 """
@@ -32,6 +36,12 @@ import requests
 name = "deepseek"
 capabilities = {"chat", "search", "vision"}
 default_model = "default"
+
+# 能力名 → 请求方言（PROVIDER_SPEC.md §1）。
+# DeepSeek 没有生成类能力（t2i / t2v / slides / web_dev …），请求体里也没有
+# chat_type / assistant_id 这类方言参数 —— 用户能拨的只有 think / search 两个开关。
+# 空表是诚实的答案：不编造不存在的方言。
+CAPABILITY_MAP: dict = {}
 
 DST = "https://chat.deepseek.com"
 USER_AGENT = (
@@ -252,16 +262,50 @@ def upload(path: str) -> dict:
 
 # ── SSE 解析 ────────────────────────────────────────────────────
 
-def _parse_sse(raw: str) -> dict:
-    """粘性路径流：p 一旦出现就沿用。
+def _stream_finished(line: str) -> bool:
+    """这一行是否是"主响应结束"信号。
 
+    ⚠️ 服务端会回**多个** FINISHED：检索阶段的 `response/search_status` 也回 FINISHED。
+    只认主路径 `response/status` —— 否则开搜索时会在检索阶段就提前断流、正文全丢。
+    （`response/search_status` 不含子串 `response/status`，下面的判定天然把它们分开。）
+    """
+    return '"response/status"' in line and '"FINISHED"' in line
+
+
+def _parse_sse(raw: str) -> dict:
+    """解析 completion 的 SSE 流。
+
+    粘性路径：``p`` 一旦出现就沿用（后续帧可能省略 ``p``）。
     首块正文内嵌在第一个 response 快照的 content 里，不走 delta 流 ——
     只收 delta 会每轮丢开头。
+
+    返回**老键**（text / thinking / message_id / references / queries），
+    并新增可选键：
+
+        phases  流里出现过的每一个通道及累计内容。DeepSeek 的 phase 等价物是 SSE 的
+                粘性路径 ``p``（如 ``response/content``）；``event:`` 名与帧 ``type``
+                也一并留痕。**不做"已知 phase 白名单"筛流** —— 白名单会静默丢产物/新通道。
+        model   服务端实际使用的 model_type（ready 帧给出）。
+        extra   首个 response 快照原样留档（不加工）。
+
+    正文（text）仍只取 ``response/content``（含首块快照 seed），thinking 取含
+    ``thinking`` 的路径 —— **老行为一字未改**，新增的只是"不丢"。
     """
     buf, think = [], []
-    msg_id, status, path, err, search_results = None, None, None, None, None
+    msg_id, status, path, err, search_results, model = None, None, None, None, None, ""
+    phases = {}   # 通道名 → 累计内容（未知通道同样留痕）
+    extra = {}    # 首个 response 快照，原样
+
+    def _mark(channel: str, content: str = "") -> None:
+        """登记一个通道。未知通道也登记 —— 这是"不丢"的唯一保证。"""
+        if channel:
+            phases[channel] = phases.get(channel, "") + content
 
     for line in raw.split("\n"):
+        # SSE 的 event 名也是流的一部分 —— 未知 event 同样不能丢
+        if line.startswith("event:"):
+            _mark(line[6:].strip())
+            continue
         if not line.startswith("data: "):
             continue
         try:
@@ -271,9 +315,19 @@ def _parse_sse(raw: str) -> dict:
 
         if obj.get("type") == "error":
             err = obj.get("content") or err
+            _mark("error", str(obj.get("content") or ""))
             if "rate_limit" in str(obj.get("finish_reason") or "").lower():
                 raise RuntimeError(f"限流: {err} （稍等 20-30s 再试）")
             continue
+
+        # ready 帧：response_message_id 与真实 model_type（老解析忽略了它）
+        if "response_message_id" in obj or "model_type" in obj:
+            msg_id = obj.get("response_message_id") or msg_id
+            model = obj.get("model_type") or model
+
+        # 帧自带的 type（非 error）也留痕 —— 未知类型不丢
+        if obj.get("type"):
+            _mark(str(obj["type"]))
 
         if "p" in obj:
             path = obj["p"]
@@ -281,10 +335,18 @@ def _parse_sse(raw: str) -> dict:
                 sr = obj.get("v")
                 if isinstance(sr, list):
                     search_results = sr
+            _mark(path)  # 出现即登记（v 未必是字符串）
 
         v = obj.get("v")
+
+        # delta 帧：按（粘性）path 累积 —— 不做 phase 白名单
+        if isinstance(v, str) and path:
+            _mark(path, v)
+
         if isinstance(v, dict) and "response" in v:
             ro = v["response"] or {}
+            if not extra:
+                extra = ro  # 首个快照原样留档
             msg_id = ro.get("message_id") or msg_id
             status = ro.get("status") or status
             c0 = ro.get("content")
@@ -304,14 +366,19 @@ def _parse_sse(raw: str) -> dict:
     if err and not buf:
         raise RuntimeError(f"DeepSeek 拒绝: {err}")
 
-    return {
+    out = {
         "text": "".join(buf),
         "thinking": "".join(think),
         "message_id": msg_id,
         "references": [{"url": d.get("url", ""), "title": d.get("title", ""),
                         "snippet": d.get("snippet", "")} for d in (search_results or [])],
         "queries": [],
+        "phases": phases,
+        "model": model,
     }
+    if extra:
+        out["extra"] = extra
+    return out
 
 
 # ── 发消息 ──────────────────────────────────────────────────────
@@ -366,7 +433,8 @@ def ask(
                         continue
                     raw += line + "\n"
                     # ⚠️ search_status 也会回 FINISHED，只认 response/status
-                    if '"response/status"' in line and '"FINISHED"' in line:
+                    #    （判定集中在 _stream_finished，便于离线自测）
+                    if _stream_finished(line):
                         break
             return _parse_sse(raw)
         except RuntimeError as e:
@@ -391,3 +459,50 @@ def search(query: str, *, think: bool = False, model: str = "") -> dict:
         "session_id": sid,
         "message_id": r["message_id"],
     }
+
+
+# ── 可选钩子（PROVIDER_SPEC.md §1/§3/§4/§6）──────────────────────
+# 都是"缺了自动降级"的可选实现，不影响老契约 ask / search / upload。
+
+def models() -> list:
+    """DeepSeek 没有公开的模型枚举接口 —— 诚实返回空表。
+
+    实测请求体里只有一个 ``model_type: "default"``；用户能拨的其实是思考(think) /
+    联网(search) 两个**开关**，而不是"选模型"。硬编 "deepseek-chat" 之类的名字
+    只会随时间过期，故返回 ``[]``（不是错误）—— 调用方不该把可选能力当契约用。
+    """
+    return []
+
+
+def probe(capability: str = "") -> dict:
+    """DeepSeek 没有可读的能力/模型配置接口，只能"实际发一次看报什么错"。
+
+    一律返回 ``supported=None``（不知道就是不知道），不猜。``__init__.probe()``
+    会照常收下这个结果。
+    """
+    return {
+        "supported": None,
+        "via": "none",
+        "note": "无公开枚举接口；能力(chat/search/vision)只能靠实发一次从报错推断。",
+    }
+
+
+def classify(text: str = "", status: int = 0, raw=None, exc=None, **_):
+    """错误归类。只覆盖本家方言；其余返回空串，由 ``__init__.classify()`` 落到通用词表。
+
+    本家方言（实测）：限流。服务端回
+        ``{"type":"error","content":"Messages too frequent. Try again later.",
+           "finish_reason":"rate_limit_reached"}``
+    ``rate_limit_reached`` 带下划线，通用词表里的 "rate limit" / "ratelimit" 都匹配不到
+    → 会被误判成 UNKNOWN，导致调用方做错的重试决策。故在此归 ``quota``。
+
+    非方言文本返回 ``""``（假值）：``__init__.classify()`` 见假值会自动落到
+    ``core.classify_text()`` —— 通用词表只维护那一份，不在这里复制第二份。
+    """
+    blob = text or (str(exc) if exc is not None else "")
+    if isinstance(raw, dict):
+        blob += " " + str(raw.get("finish_reason") or "")
+    low = blob.lower()
+    if "rate_limit" in low or "frequent" in low:
+        return "quota"
+    return ""
