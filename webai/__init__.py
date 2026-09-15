@@ -36,6 +36,7 @@ _MODULES = {
     "qwen": "qwen",
     "deepseek": "deepseek",
     "stepfun": "stepfun",
+    "glm": "glm",
 }
 
 _cache = {}
