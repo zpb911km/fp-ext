@@ -62,6 +62,34 @@ GET /api/v2/task/status/496149f7-03a7-401d-8b4e-de7a036cb254
 2. **`Reply`/`Asset` 需要"原样透传 provider 元数据"的槽位**（`extra`）。能力语义千变万化，但平台已经结构化了 —— **别建模，搬运**。
 3. **一次调用可能要等 4 分钟**，工具层超时得覆盖。
 
+### 另外两个 Qwen 能力（第四、第五种形态）
+
+**`web_dev`（网页开发）—— 产物是源码，不是资产**
+
+| 项 | 值 |
+|---|---|
+| 菜单名 | 网页开发 |
+| `chats/new` 的 `chat_type` | **`artifacts`** ← 注意不是 `web_dev` |
+| 消息的 `sub_chat_type` | `web_dev` |
+| 产物 | **`phase:"answer"` 的正文本身** —— 11,186 字符 HTML，包在代码围栏里 |
+| 有无 URL | **没有**。前端自己渲染成 iframe 预览（DOM 里有「预览 / 代码 / 部署」） |
+| 耗时 | ~15s，单轮 |
+
+→ **第四种产物载体：正文文本本身。** `Asset` 要能装"无 URL、内联源码"。
+
+**`deep_research`（深入研究）—— 强制澄清循环**
+
+| 项 | 值 |
+|---|---|
+| 菜单名 | 深入研究 |
+| `chat_type` | `deep_research` |
+| `sub_chat_type` | **`deep_thinking`** |
+| 首轮行为 | **只反问，不出报告** |
+| 能否跳过 | **否** —— 明说"无需再确认"仍继续追问；连答 3 轮，3 轮都继续追问 |
+
+→ 不是"模型可能问也可能不问"，是**设计上的交互门控**。
+→ 工程后果：调用方必须能识别"它在问我"，且**必须设最大轮数**，否则会无限对话下去。
+
 ---
 
 ## 2. 结论一：**不存在"独立端点"**
@@ -110,6 +138,23 @@ provider 层读到它就能决定走哪条路。
 
 → 这也再次否掉了 `run()` 这个动词：如果它只是"自动发确认"，那是一个**helper**，不是协议原语。
 
+## 4.6 结论五：能力的命名有**三层，且互不相等**
+
+| 菜单名 | `chat_type` | `sub_chat_type` |
+|---|---|---|
+| 生成图像 | `t2i` | `t2i` |
+| 创建视频 | `t2v` | `t2v` |
+| 幻灯片 | `slides` | `slides` |
+| **网页开发** | **`artifacts`** | `web_dev` |
+| **深入研究** | `deep_research` | **`deep_thinking`** |
+
+**没有哪一层等于另一层。** 且 `artifacts` 是**容器型 chat_type**，可承载多个 sub 能力。
+
+→ 这**证伪了"枚举能力"的可行性**：连命名都对不上，根本列不全。
+→ 也否掉了上轮"能力 = chat_type"的简化（错的）。
+
+**所以能力名只能是开放字符串，靠探测/试错得到。**
+
 ---
 
 ## 5. 抽象设计
@@ -131,8 +176,9 @@ provider 层读到它就能决定走哪条路。
 ```python
 @dataclass
 class Asset:            # 万能产物：调用方只认它，不认平台
-    kind: str           # image | video | ppt | webpage | report | file
-    url: str
+    kind: str           # image | video | pdf | ppt | webpage | code | file
+    url: str | None     # ← 可空：web_dev 的产物根本没有 URL
+    content: str | None # ← 内联内容（如 HTML 源码），与 url 二选一
     path: str | None    # 已落盘（URL 会过期，重要）
     meta: dict          # 宽高 / 时长 / 页数 / 引用
     expires_at: int | None
@@ -243,9 +289,13 @@ ErrorKind = AUTH | QUOTA | UNSUPPORTED | TRANSIENT | CONTENT_POLICY | UNKNOWN
 
 - [ ] GLM 生视频（`assistant_id=668d03b2e99d661ed3c32516`）是否同为同步 SSE？
 - [ ] GLM 的 PPT / 深度研究 / 海报 / 数据分析（`engine_*` 模式）形态未知
+- [ ] `web_dev` 的「部署」按钮走什么接口（可能产出真实 URL）—— 未抓
+- [ ] `artifacts` 容器下还有哪些 sub 能力 —— 未枚举
 - [ ] slides 的 `pdf_url` 与 `slide_pages` 是否总是同时给 —— 单样本
 - [x] Qwen `slides` 形态已实测 → **多轮交互**（见 §1）
-- [ ] Qwen `deep_research` / `web_dev` 形态未知
+- [x] Qwen `web_dev` 形态已实测 → 产物是**源码**（无 URL）
+- [x] Qwen `deep_research` → **强制澄清循环**，未拿到报告（连追 3 轮）
+- [ ] deep_research 的澄清循环有无深度上限 —— 未知（3 轮未见底）
 - [ ] `slides` 的第二轮能否跳过（直接一次拿产物）—— 未试
 - [ ] `probe()` 只在 Qwen / GLM 有配置接口可依；DeepSeek 无
 - [ ] 产物 URL 的实际过期时间（Qwen JWT 有 exp；GLM `testpath` 未观察）
