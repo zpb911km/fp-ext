@@ -35,6 +35,7 @@ import importlib
 _MODULES = {
     "qwen": "qwen",
     "deepseek": "deepseek",
+    "stepfun": "stepfun",
 }
 
 _cache = {}
