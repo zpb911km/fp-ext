@@ -2,6 +2,11 @@
 Vision —— 让网页版 AI 看图
 ================================================
 
+三个工具的分工（provider 层已统一在 public/webai/，差别只在工具语义）：
+    vision   = provider.ask()     无状态单轮，带图片附件 —— 本工具
+    ask_llm  = provider.search()  无状态单轮，总是联网检索
+    copilot  = provider.ask()     有状态多轮，记得上下文
+
 多后端：上传与理解的差异全在 public/webai/，本插件只做参数校验与结果整形。
 
     qwen      OSS STS 上传，把文件挂到 message.files
@@ -156,8 +161,11 @@ PLUGIN_DEFINITION = {
     "function": {
         "name": "vision",
         "description": (
-            "将图像上传到网页版AI模型识别，返回文字描述或回答关于图像的问题。"
-            "支持截图/照片/图表。"
+            "看图并回答问题（上传图片，单次对话，多后端）。支持截图 / 照片 / 图表 / 流程图。"
+            "实测为真正的图像理解，不只是 OCR（零文字几何图也能答对图形与位置）。"
+            "注意：本工具走的是对话接口，不带联网检索；它也不保留上下文，每次都是新对话。"
+            "边界：要联网查资料 → ask_llm；要多轮讨论 / 让它记住结论 → copilot"
+            "（但 copilot 目前不接受图片附件，需要看图先用本工具取回文字描述）。"
         ),
         "parameters": {
             "type": "object",

@@ -2,9 +2,13 @@
 Ask LLM —— 向网页版 AI 提问（无状态单轮）
 ================================================
 
-与 copilot 的分工：
-    ask_llm  = 无状态单轮：问一句、答一句，用完即弃（查资料）
-    copilot  = 有状态多轮：同一会话记得上下文（探讨 / 评审 / 结对）
+三个工具的分工（provider 层已统一在 public/webai/，差别只在工具语义）：
+    ask_llm  = provider.search()  无状态单轮，**总是联网检索**，返回答案 + 引用来源
+    vision   = provider.ask()     无状态单轮，带图片附件（看图问答）
+    copilot  = provider.ask()     有状态多轮，同一会话记得上下文（探讨 / 评审 / 结对）
+
+注意 ask_llm 与 vision 走的是**不同的 provider 方法**（search vs ask），
+所以不是"vision 是 ask_llm 的特例"——两者服务不同意图，故各自保留。
 
 多后端：真正的调用细节（端点 / 鉴权 / 搜索解析）在 public/webai/。
 本插件只做：能力选择 + 结果格式化。
@@ -18,7 +22,7 @@ provider 可选（取决于 webai 里注册了哪些）：
 __fp__ = {
     "name": "ask_llm",
     "version": "2.0.0",
-    "description": "向网页版AI模型提问（无状态单轮，多后端）",
+    "description": "联网检索并作答（无状态单轮，多后端）",
     "author": "zpb",
     "license": "GPL-3.0",
     "type": "tools",
@@ -179,17 +183,19 @@ PLUGIN_DEFINITION = {
     "function": {
         "name": "ask_llm",
         "description": (
-            "向当前最强大的在线llm模型网页版发出单轮次独立询问."
-            "功能: 1. 全网络信息检索总结; 2. 思考复杂问题; 3. 获得示范"
-            "注意: 此接口不保留状态,llm没有上下文,可以多次调用,但无法多轮对话"
-            "需要多轮探讨/记住上下文请用 copilot。"
+            "联网检索并作答（无状态单轮，多后端）。"
+            "总是开启网页搜索，返回答案 + 结构化引用来源，"
+            "适合查资料、要出处的实时性问题、多厂商交叉验证（同一问题换 provider 对比）。"
+            "不保留上下文：每次调用都是一次全新对话。"
+            "边界：要多轮探讨 / 让它记住上下文 → copilot；"
+            "要理解一张图（截图 / 图表） → vision。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "keywords": {
                     "type": "string",
-                    "description": "发问,或者想对其说的话",
+                    "description": "要检索并回答的问题（本工具总是联网搜索，写成问题陈述比写成指令更有效）",
                 },
                 "provider": {
                     "type": "string",
