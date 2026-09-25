@@ -1,0 +1,6 @@
+# 运行时产物（审计留本地，不入库；shots 含页面截图可能带账号信息）
+*.log
+state.json
+ds_backend.sock
+xvfb.pid
+shots/
