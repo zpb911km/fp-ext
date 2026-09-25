@@ -14,7 +14,7 @@
   * §6 `ask()` 啥都没收到 → 自动重发一次（且复用同一份请求体）
   * §7 WAF 错误的文案**不许**再提"cookie 失效"（会把排查引向重登，实测无关）
   * §8 `classify()` 把 WAF 判成 transient 而不是 auth
-  * §9 自愈代理的 TRANSIENT 退避重试（与 AUTH 刷新是两条独立通道）
+  * §9 自愈代理的两条通道：TRANSIENT → 退避重试；AUTH → **立即抛 + 非阻塞拉起 login**（不重试）
 """
 
 import importlib.util
@@ -319,7 +319,7 @@ def test_classify(webai):
 # ── §9 自愈代理：TRANSIENT 退避重试 ─────────────────────────────
 
 def test_transient_retry(webai):
-    print("== 9. 自愈代理：TRANSIENT 退避重试（与 AUTH 刷新分家）==")
+    print("== 9. 自愈代理：TRANSIENT 退避重试 / AUTH 立即抛 + 后台登录 ==")
 
     class FakeMod:
         capabilities = {"chat", "search"}
@@ -342,9 +342,12 @@ def test_transient_retry(webai):
             return self.ask()
 
     heals = []
-    real_heal = webai._heal
+    # ⚠️ 契约已改（2026-09，见 `_wrap_heal` docstring 与 test_login_layer §5）：
+    #    AUTH **不再重试** —— 立即把失败交回系统，同时**非阻塞**拉起 `login.py <name>`。
+    #    所以这里 hook 的是 `_spawn_login`，而不是已删除的 `_heal`。
+    real_spawn = webai._spawn_login
     real_backoff = webai._retry_backoff
-    webai._heal = lambda n: (heals.append(n), True)[1]
+    webai._spawn_login = lambda n: heals.append(n)
     webai._retry_backoff = lambda: (0.001, 0.001)      # 别真等 3.3 秒
     try:
         import requests
@@ -379,17 +382,31 @@ def test_transient_retry(webai):
         chk(fake3.calls == 1, "UNKNOWN 不重试")
         chk(heals == [], "UNKNOWN 不刷新")
 
-        # ④ AUTH 仍然只刷一次（且**不**走退避通道）
+        # ④ AUTH → **立即失败 + 拉起后台登录，不重试**（契约见 _wrap_heal）
+        #    旧行为是"刷新一次再重试一次"；现刷新不回填、不阻塞、不重试。
         fake4 = FakeMod(RuntimeError("Token has expired, please log in again."),
                         fail_times=99)
         webai._cache["qwen"] = webai._HealingProvider("qwen", fake4)
         try:
             webai.get("qwen").ask("s", "hi")
-            chk(False, "AUTH 刷新后仍失败 → 抛")
+            chk(False, "AUTH 应当立刻抛给系统")
         except RuntimeError:
-            chk(True, "AUTH 刷新后仍失败 → 原样抛出")
-        chk(heals == ["qwen"], "AUTH 触发刷新")
-        chk(fake4.calls == 2, "AUTH 只重试一次（刷新那次），不叠加退避")
+            chk(True, "AUTH 立即原样抛出（不阻塞、不等登录）")
+        chk(heals == ["qwen"], "AUTH 拉起了 login.py 后台自愈")
+        chk(fake4.calls == 1, f"AUTH **不重试**（只调 1 次，实际 {fake4.calls}）")
+        # ④b AUTH 不走退避通道 —— 退避表是空的也照样立即抛
+        heals.clear()
+        fake4b = FakeMod(RuntimeError("Token has expired, please log in again."), 99)
+        webai._cache["qwen"] = webai._HealingProvider("qwen", fake4b)
+        webai._retry_backoff = lambda: ()
+        try:
+            webai.get("qwen").ask("s", "hi")
+            chk(False, "空退避表下 AUTH 仍应抛")
+        except RuntimeError:
+            chk(True, "AUTH 与退避表无关")
+        chk(fake4b.calls == 1, "空退避表下也只调 1 次")
+        chk(heals == ["qwen"], "且照样拉起登录")
+        webai._retry_backoff = lambda: (0.001, 0.001)
 
         # ⑤ 开关：FP_WEBAI_NO_RETRY=1 关掉退避重试
         os.environ["FP_WEBAI_NO_RETRY"] = "1"
@@ -405,7 +422,7 @@ def test_transient_retry(webai):
         chk(fake5.calls == 1, "关掉开关 → 只调 1 次")
     finally:
         os.environ.pop("FP_WEBAI_NO_RETRY", None)
-        webai._heal = real_heal
+        webai._spawn_login = real_spawn
         webai._retry_backoff = real_backoff
 
 
@@ -417,61 +434,86 @@ def test_copilot_warnings():
     import tempfile
     import types
 
-    # 注意目录层级：本文件在 <webai>/lib/tests/，PKG 是 <webai>/lib，
-    # 而插件根是 <webai>、plugins 根是它的上一级。
-    plugin_root = os.path.dirname(PKG)
-    plugins_root = os.path.dirname(plugin_root)
-    plug = types.ModuleType("plugins")
-    plug.__path__ = [plugins_root]
-    sys.modules["plugins"] = plug
-    spec = importlib.util.spec_from_file_location(
-        "plugins.webai", os.path.join(plugin_root, "__init__.py"),
-        submodule_search_locations=[plugin_root])
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["plugins.webai"] = mod
-    spec.loader.exec_module(mod)
-    cp = importlib.import_module("plugins.webai.tools.copilot")
+    # ⚠️ 本测试会 (a) 替换 sys.modules["plugins"/"plugins.webai"]、
+    #    (b) **直接改 copilot 模块属性**（_get_provider / _STORE_FILE）。
+    #    独立跑时进程随即退出，看不出问题；被 pytest 与别的套件**合跑**时，
+    #    后收集的测试拿到的是被改坏的模块 —— 2026-09 实测就这么把
+    #    plugins/webai/tests 的两个 copilot 用例打挂了（隔离跑却全绿）。
+    #    故：进场先存，finally 一律还原。
+    _saved_modules = {k: sys.modules.get(k)
+                      for k in ("plugins", "plugins.webai",
+                                "plugins.webai.tools",
+                                "plugins.webai.tools.copilot")}
+    _orig_cp = _saved_modules["plugins.webai.tools.copilot"]
+    _saved_attrs = ({a: getattr(_orig_cp, a)
+                     for a in ("_get_provider", "_STORE_FILE")}
+                    if _orig_cp is not None else {})
 
-    cp._STORE_FILE = os.path.join(tempfile.mkdtemp(), "sessions.json")   # 别碰真 store
+    try:
+        # 注意目录层级：本文件在 <webai>/lib/tests/，PKG 是 <webai>/lib，
+        # 而插件根是 <webai>、plugins 根是它的上一级。
+        plugin_root = os.path.dirname(PKG)
+        plugins_root = os.path.dirname(plugin_root)
+        plug = types.ModuleType("plugins")
+        plug.__path__ = [plugins_root]
+        sys.modules["plugins"] = plug
+        spec = importlib.util.spec_from_file_location(
+            "plugins.webai", os.path.join(plugin_root, "__init__.py"),
+            submodule_search_locations=[plugin_root])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["plugins.webai"] = mod
+        spec.loader.exec_module(mod)
+        cp = importlib.import_module("plugins.webai.tools.copilot")
 
-    class P:
-        default_model = "m1"
+        cp._STORE_FILE = os.path.join(tempfile.mkdtemp(), "sessions.json")   # 别碰真 store
 
-        def available(self):
-            return True, ""
+        class P:
+            default_model = "m1"
 
-        def new_session(self, model=""):
-            return "chat-1"
+            def available(self):
+                return True, ""
 
-        def ask(self, *a, **k):
-            return {"text": "hi", "message_id": None}        # ← 续接指针丢了
+            def new_session(self, model=""):
+                return "chat-1"
 
-    cp._get_provider = lambda n: P()
-    r = cp.copilot_say("hello", "s1", provider="qwen")
-    chk(r.get("success") is True, "回答照常返回（不因为缺指针就吞掉）")
-    chk(bool(r.get("warnings")), "拿不到 message_id → 出警告，而不是静默沿用旧指针")
-    chk(any("续接指针" in w for w in r.get("warnings") or []),
-        f"警告要说清问题：{r.get('warnings')}")
-    chk(cp._get_session_rec("s1").get("last_response_id") is None, "不伪造指针")
+            def ask(self, *a, **k):
+                return {"text": "hi", "message_id": None}        # ← 续接指针丢了
 
-    class P2(P):
-        def ask(self, *a, **k):
-            return {"text": "hi", "message_id": "m", "truncated": True,
-                    "truncated_reason": "ChunkedEncodingError: IncompleteRead"}
+        cp._get_provider = lambda n: P()
+        r = cp.copilot_say("hello", "s1", provider="qwen")
+        chk(r.get("success") is True, "回答照常返回（不因为缺指针就吞掉）")
+        chk(bool(r.get("warnings")), "拿不到 message_id → 出警告，而不是静默沿用旧指针")
+        chk(any("续接指针" in w for w in r.get("warnings") or []),
+            f"警告要说清问题：{r.get('warnings')}")
+        chk(cp._get_session_rec("s1").get("last_response_id") is None, "不伪造指针")
 
-    cp._get_provider = lambda n: P2()
-    r2 = cp.copilot_say("hello", "s2", provider="qwen")
-    chk(any("截断" in w for w in r2.get("warnings") or []), "truncated 也出声")
-    chk(cp._get_session_rec("s2").get("last_response_id") == "m", "能拿到指针就正常落库")
+        class P2(P):
+            def ask(self, *a, **k):
+                return {"text": "hi", "message_id": "m", "truncated": True,
+                        "truncated_reason": "ChunkedEncodingError: IncompleteRead"}
 
-    class P3(P):
-        def ask(self, *a, **k):
-            return {"text": "hi", "message_id": "m"}      # 指针有、流完整
+        cp._get_provider = lambda n: P2()
+        r2 = cp.copilot_say("hello", "s2", provider="qwen")
+        chk(any("截断" in w for w in r2.get("warnings") or []), "truncated 也出声")
+        chk(cp._get_session_rec("s2").get("last_response_id") == "m", "能拿到指针就正常落库")
 
-    cp._get_provider = lambda n: P3()
-    r3 = cp.copilot_say("hello", "s3", provider="qwen")
-    chk(not r3.get("warnings"), f"一切正常时**不出**警告（不狼来了）：{r3.get('warnings')}")
+        class P3(P):
+            def ask(self, *a, **k):
+                return {"text": "hi", "message_id": "m"}      # 指针有、流完整
 
+        cp._get_provider = lambda n: P3()
+        r3 = cp.copilot_say("hello", "s3", provider="qwen")
+        chk(not r3.get("warnings"), f"一切正常时**不出**警告（不狼来了）：{r3.get('warnings')}")
+
+    finally:
+        for k, v in _saved_modules.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        if _orig_cp is not None:
+            for a, v in _saved_attrs.items():
+                setattr(_orig_cp, a, v)
 
 def main():
     webai = load()

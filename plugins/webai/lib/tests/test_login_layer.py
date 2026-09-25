@@ -10,14 +10,18 @@
   * 四家都有 verify()，且**网络异常 → unknown**（绝不误报 dead → 绝不误触发登录）
   * 认证类文本能被识别（judge 升级 unknown→dead 的那一刀）
   * silent_refresh 的护栏：开关 / 未知 provider / 并发锁
-  * 自愈代理：只拦 ask/search/upload/poll；AUTH→刷新+重试一次；非 AUTH 不拦
+  * 自愈代理：只拦 ask/search/upload/poll；AUTH→**立即失败返回 + 非阻塞后台拉起
+    login.py**（成功不回填、不重试）；非 AUTH 不拦
+  * 负载均衡：同一后端 new_session 限速（env 可覆盖 / 可整体关闭）
 """
 
 import importlib
 import importlib.util
 import os
 import sys
+import time
 import types
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
@@ -273,18 +277,32 @@ def main():
             raw._session = old
         chk(st == "unknown", f"{n}.verify() 网络异常 → unknown（得到 {st}）")
 
-    # deepseek / stepfun 走 new_session 探针
-    for n in ("deepseek", "stepfun"):
-        raw = webai.raw(n)
-        old = raw.new_session
-        raw.new_session = _Boom(RuntimeError("network unreachable"))
-        try:
-            st, msg = raw.verify()
-        except Exception as e:  # noqa: BLE001
-            st, msg = "EXC", str(e)
-        finally:
-            raw.new_session = old
-        chk(st == "unknown", f"{n}.verify() 非鉴权失败 → unknown（得到 {st}）")
+    # stepfun 走 new_session 探针
+    raw = webai.raw("stepfun")
+    old = raw.new_session
+    raw.new_session = _Boom(RuntimeError("network unreachable"))
+    try:
+        st, msg = raw.verify()
+    except Exception as e:  # noqa: BLE001
+        st, msg = "EXC", str(e)
+    finally:
+        raw.new_session = old
+    chk(st == "unknown", f"stepfun.verify() 非鉴权失败 → unknown（得到 {st}）")
+
+    # deepseek 是本地自检（安全后端 + 真 Chrome + profile，不联网不发探针）：
+    # 后端/浏览器缺失 → unknown（绝不误报 dead → 绝不误触发登录）
+    raw = webai.raw("deepseek")
+    old_b, old_c = raw.BACKEND, raw._CHROME
+    try:
+        raw.BACKEND = Path("/nonexistent/backend.py")
+        st, msg = raw.verify()
+        chk(st == "unknown", f"deepseek.verify() 后端缺失 → unknown（得到 {st}）")
+        raw.BACKEND = old_b
+        raw._CHROME = Path("/nonexistent/chrome")
+        st, msg = raw.verify()
+        chk(st == "unknown", f"deepseek.verify() Chrome 缺失 → unknown（得到 {st}）")
+    finally:
+        raw.BACKEND, raw._CHROME = old_b, old_c
 
     print("== 3. 认证类文本识别（unknown → dead 的那一刀）==")
     for t in ("Token has expired, please log in again.",
@@ -336,19 +354,19 @@ def main():
     chk(p.capabilities == {"chat", "search"}, "普通属性原样转发")
     chk(p.HELLO == "hi", "常量也转发")
 
-    heals = []
-    real_heal = webai._heal          # 记下真的 —— 最后要还原（stub 会绕过开关）
-    webai._heal = lambda n: (heals.append(n), True)[1]
+    spawns = []
+    real_spawn = webai._spawn_login   # 记下真的 —— 最后要还原（stub 会绕过开关）
+    webai._spawn_login = lambda n: spawns.append(n)
     try:
         p.ask("s", "hi")
-        chk(False, "AUTH 错误重试后仍失败 → 应抛出")
+        chk(False, "AUTH 错误 → 应立即抛出")
     except RuntimeError:
-        chk(True, "AUTH 错误刷新后仍失败 → 照原样抛出")
-    chk(heals == ["qwen"], "AUTH 错误触发了一次刷新")
-    chk(fake.calls == 2, "且只重试一次（共调用 2 次）")
+        chk(True, "AUTH 错误 → 立即抛出（不阻塞等登录）")
+    chk(spawns == ["qwen"], "AUTH 错误触发一次后台登录拉起")
+    chk(fake.calls == 1, "失败立即返回系统，不重试（共调用 1 次）")
 
-    # AUTH 错误 + 刷新成功 → 返回重试结果
-    heals.clear()
+    # AUTH 错误 + 第二次会成功 → 也**不回填**（成功了也不返回）
+    spawns.clear()
     fake2 = FakeMod()
 
     def ask_ok_once(self, *a, **k):
@@ -359,12 +377,16 @@ def main():
     fake2.ask = types.MethodType(ask_ok_once, fake2)
     webai._cache["qwen"] = webai._HealingProvider("qwen", fake2)
     p = webai.get("qwen")
-    out = p.ask("s", "hi")
-    chk(out == "second-ok", "刷新成功 → 重试拿到结果")
-    chk(heals == ["qwen"], "恰好刷新一次")
+    try:
+        out = p.ask("s", "hi")
+        chk(False, f"AUTH 应抛出（即便重试会成功，得到 {out!r}）")
+    except RuntimeError:
+        chk(True, "即便第二次会成功也不重试（后台成功不回填）")
+    chk(fake2.calls == 1, "未发生重试")
+    chk(spawns == ["qwen"], "恰好拉起一次登录")
 
-    # 非 AUTH 错误：不该刷新（用全新替身，只走 search —— 别让 ask 的 AUTH 计数混进来）
-    heals.clear()
+    # 非 AUTH 错误：不该拉登录（用全新替身，只走 search —— 别让 ask 的 AUTH 计数混进来）
+    spawns.clear()
     fake3 = FakeMod()
     webai._cache["qwen"] = webai._HealingProvider("qwen", fake3)
     try:
@@ -372,15 +394,50 @@ def main():
         chk(False, "非 AUTH 错误应原样抛出")
     except ValueError:
         chk(True, "非 AUTH 错误原样抛出")
-    chk(heals == [], "非 AUTH 错误不触发刷新")
+    chk(spawns == [], "非 AUTH 错误不触发登录拉起")
     chk(fake3.calls == 1, "非 AUTH 错误不重试")
 
-    # 开关能关掉自愈 —— 必须用**真的** _heal 才测得到（上面的 stub 会绕过开关）
-    webai._heal = real_heal
+    # 开关能关掉自愈 —— 用**真的** _spawn_login 测（上面的 stub 会绕过开关）
+    webai._spawn_login = real_spawn
     os.environ["FP_WEBAI_NO_AUTOLOGIN"] = "1"
-    chk(webai._heal("qwen") is False,
-        "FP_WEBAI_NO_AUTOLOGIN=1 时 _heal 直接返回 False（不 spawn 登录子进程）")
+    spawned = []
+    real_popen = webai.subprocess.Popen
+    webai.subprocess.Popen = lambda *a, **k: spawned.append(a) or types.SimpleNamespace(poll=lambda: 0)
+    try:
+        webai._spawn_login("qwen")
+    finally:
+        webai.subprocess.Popen = real_popen
+    chk(spawned == [], "FP_WEBAI_NO_AUTOLOGIN=1 时不拉起登录子进程")
     os.environ.pop("FP_WEBAI_NO_AUTOLOGIN", None)
+
+    # ── 负载均衡：仅限制同一后端新建会话频率 ──
+    print("== 5b. 负载均衡：同一后端 new_session 限速 ==")
+    ns_calls = []
+
+    def fake_ns(*a, **k):
+        ns_calls.append(time.time())
+        return "sid"
+
+    wrapped = webai._wrap_new_session("qwen", fake_ns)
+    os.environ["FP_WEBAI_NS_INTERVAL_QWEN"] = "0.4"
+    try:
+        webai._ns_last.pop("qwen", None)
+        t0 = time.time()
+        wrapped()
+        wrapped()
+        dt = time.time() - t0
+        chk(len(ns_calls) == 2, "两次 new_session 都执行")
+        chk(dt >= 0.4, f"第二次被限速（间隔 {dt:.2f}s ≥ 0.4s）")
+        # 整体开关：关掉后不再等待
+        os.environ["FP_WEBAI_NO_BALANCE"] = "1"
+        webai._ns_last.pop("qwen", None)
+        t0 = time.time()
+        wrapped()
+        wrapped()
+        chk(time.time() - t0 < 0.35, "FP_WEBAI_NO_BALANCE=1 → 不限速")
+    finally:
+        os.environ.pop("FP_WEBAI_NS_INTERVAL_QWEN", None)
+        os.environ.pop("FP_WEBAI_NO_BALANCE", None)
 
     test_stepfun_renew(webai, login)
 
