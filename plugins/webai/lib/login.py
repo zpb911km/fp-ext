@@ -38,6 +38,7 @@ SPEC = {
     "deepseek": ("deepseek_login.py", "DeepSeek"),
     "stepfun":  ("stepfun_login.py",  "StepFun"),
     "glm":      ("glm_login.py",      "GLM"),
+    "mimo":     ("mimo_login.py",     "MiMo"),
 }
 
 SILENT_TIMEOUT = 45        # 静默刷新的硬上限（秒）：playwright 启动 + 短轮询
