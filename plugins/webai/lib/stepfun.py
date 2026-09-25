@@ -36,7 +36,7 @@ except Exception:                       # noqa: BLE001  被当独立模块加载
     _core = None
 
 name = "stepfun"
-capabilities = {"chat", "search", "vision"}
+capabilities = {"chat", "search", "vision", "attach"}
 default_model = "step-auto"
 
 # ── 新契约（可选钩子，见 PROVIDER_SPEC.md §1）────────────────────
@@ -487,9 +487,10 @@ def _harvest_assets(body) -> list:
 
 # ── 便捷：一次性联网搜索 ────────────────────────────────────────
 
-def search(query: str, *, think: bool = False, model: str = "") -> dict:
+def search(query: str, *, think: bool = False, model: str = "",
+           files: list | None = None) -> dict:
     sid = new_session(model)
-    r = ask(sid, query, model=model, think=think, search=True)
+    r = ask(sid, query, model=model, think=think, search=True, files=files)
     # 原样带上 ask() 的**所有**键（含将来新增的），只补 session_id。
     # 之前这里手写 5 个键 —— 新增的 assets/phases/model/extra 会被静默丢掉，
     # 正是"未知的东西不能丢"在 search() 边界上被违反。
@@ -501,33 +502,48 @@ def search(query: str, *, think: bool = False, model: str = "") -> dict:
 # ── 上传 ────────────────────────────────────────────────────────
 
 def _attachments(files) -> list:
-    """把 upload() 的产物转成 ChatStream 要的 resource 结构"""
+    """把 upload() 的产物转成 ChatStream 要的 resource 结构。
+
+    oneof 键按类型分流：图片 `image`、文档 `doc`（2026-09-25 实测：前端附件流里
+    FILE → {case:"doc"}，且 doc 端到端读出 md 内容）。此前硬编码 `image` 会让
+    document rid 被服务端**静默无视**（模型答"未提供内容"）。
+    """
     out = []
     for f in files:
         d = f if isinstance(f, dict) else {"ref": f}
         rid = d["ref"]
-        out.append({"resource": {"image": {
+        kind = d.get("kind")
+        if not kind:                      # 老产物/裸 ref：按 rid 前缀猜（im-/to-），猜错退回 image
+            kind = "doc" if str(rid).startswith("to-") else "image"
+        mime = d.get("mime") or (
+            "application/octet-stream" if kind == "doc" else "image/png")
+        out.append({"resource": {kind: {
             "rid": rid,
             "url": d.get("url", ""),
             "meta": d.get("meta") or {},
-            "mimeType": d.get("mime") or "image/png",
+            "mimeType": mime,
         }, "rid": rid}})
     return out
 
 
 def upload(path: str) -> dict:
-    """上传图片 → {ref: rid, name, size, url, meta, mime}。ref 放进 ask(files=[...])。
+    """上传文件 → {ref, name, size, url, meta, mime, kind}。ref 放进 ask(files=[...])。
 
-    端点 /api/resource/image，multipart 三件套：file / scene_id=image / mime_type。
+    端点按类型分流（前端同一张映射表，2026-09-25 实测均 200）：
+      图片 → /api/resource/image    （scene_id=image）
+      其它 → /api/resource/document （scene_id=file；md/txt/pdf…，模型实测能读）
     """
     fn = os.path.basename(path)
     data = open(path, "rb").read()
     mime = mimetypes.guess_type(fn)[0] or "application/octet-stream"
+    is_img = mime.startswith("image/")
     h = _headers()
     h.pop("content-type", None)          # 交给 requests 生成 multipart 边界
-    r = _call("post", f"{BASE}/api/resource/image", headers=h,
+    r = _call("post", f"{BASE}/api/resource/{'image' if is_img else 'document'}",
+              headers=h,
               files={"file": (fn, data, mime)},
-              data={"scene_id": "image", "mime_type": mime}, timeout=120)
+              data={"scene_id": "image" if is_img else "file", "mime_type": mime},
+              timeout=120)
     _check(r)
     if r.status_code != 200:
         raise RuntimeError(f"上传失败 HTTP {r.status_code}: {r.text[:200]}")
@@ -535,14 +551,55 @@ def upload(path: str) -> dict:
     if not js.get("rid"):
         raise RuntimeError(f"上传返回异常: {str(js)[:200]}")
     return {"ref": js["rid"], "name": fn, "size": len(data),
-            "url": js.get("url", ""), "meta": js.get("meta") or {}, "mime": mime}
+            "url": js.get("url", ""), "meta": js.get("meta") or {}, "mime": mime,
+            "kind": "image" if is_img else "doc"}
 
 
 # ── 新契约：模型枚举 / 能力探测 / 错误归类（PROVIDER_SPEC §3/§4/§6）──
 
 def models() -> list:
-    """枚举可选模型。stepfun **没有模型清单接口** → 诚实返回空（别硬编可能过期的名字）。"""
-    return []
+    """枚举可选模型。权威来源：`AgentService/GetChatConfig` → `chatConfig.models`
+    （Unary Connect-JSON，body `{}`，2026-09-25 实测 200 返回 13 项）。
+
+    返回规范形状 `[{"id","name","capabilities","ctx","default"}]`（PROVIDER_SPEC §0.2）。
+    任何异常 → `[]`（诚实：拿不到就说没有，别硬编可能过期的名字）。
+    """
+    try:
+        r = _call("post",
+                  f"{BASE}/api/agent/capy.agent.v1.AgentService/GetChatConfig",
+                  headers=_headers(), json={}, timeout=_HTTP_TIMEOUT)
+        if r.status_code != 200:
+            return []
+        models = ((r.json() or {}).get("chatConfig") or {}).get("models") or []
+    except Exception:                       # noqa: BLE001
+        return []
+    out, seen = [], set()
+    for it in models:
+        mid = it.get("model")
+        if not mid or mid in seen:
+            continue
+        if (it.get("availability") or {}).get("available") is False:
+            continue                         # 明确标记不可用的不列
+        seen.add(mid)
+        caps = {"chat"}
+        feats = it.get("modelFeatures") or []
+        if any(f.get("feature") == "reasoning" for f in feats):
+            caps.add("thinking")
+        if "深度思考" in (it.get("tags") or []) and "thinking" not in caps:
+            caps.add("thinking")
+        d = {"id": mid,
+             "name": it.get("displayName") or mid,
+             "capabilities": caps,
+             "ctx": int(it.get("userInputLimit") or 0)}
+        if mid == default_model:
+            d["default"] = True
+        out.append(d)
+    # step-auto（默认自动路由）不在服务端清单里，是前端硬编码的默认值
+    # （js 35920: i="step-auto"）—— 照实补列并标 default，别让调用方以为它不存在。
+    if default_model not in seen:
+        out.insert(0, {"id": default_model, "name": "Step Auto（自动路由）",
+                       "capabilities": {"chat"}, "ctx": 0, "default": True})
+    return out
 
 
 def probe(capability: str = "") -> dict:

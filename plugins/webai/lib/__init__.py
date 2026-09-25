@@ -2,7 +2,7 @@
 webai — 网页版 AI provider 层
 =================================
 
-把"某个网页版 AI 究竟怎么调"收拢在这里，工具层（copilot / ask_llm / vision）
+把"某个网页版 AI 究竟怎么调"收拢在这里，工具层（copilot / ask_llm）
 只声明自己要什么能力，不关心后端的端点与鉴权细节。
 
 加一个新后端 = 在本目录加一个模块，然后在下面 _MODULES 注册一行。
@@ -67,7 +67,9 @@ provider 契约
 import functools
 import importlib
 import os
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -79,7 +81,7 @@ __all__ = [
     "get", "raw", "names", "available", "capabilities", "has", "models", "probe",
     "first_available", "classify", "new_session", "ask", "poll", "upload",
     "capability_map", "resolve_capability",
-    "search", "asset_dir", "DEFAULT_ORDER",
+    "search", "asset_dir", "DEFAULT_ORDER", "next_available",
 ]
 
 _MODULES = {
@@ -87,6 +89,7 @@ _MODULES = {
     "deepseek": "deepseek",
     "stepfun": "stepfun",
     "glm": "glm",
+    "mimo": "mimo",
 }
 
 _cache = {}
@@ -95,7 +98,7 @@ _cache = {}
 # 命名刻意收窄：available()/models()/probe() 等"查状态"的方法**不**触发登录。
 _HEAL_METHODS = ("ask", "search", "upload", "poll")
 
-# 自愈的开关：设 FP_WEBAI_NO_AUTOLOGIN=1 可完全关掉（例如不想在失败时多花 45s）
+# 自愈的开关：设 FP_WEBAI_NO_AUTOLOGIN=1 可完全关掉（不再后台拉起 login.py）
 _ENV_OFF = "FP_WEBAI_NO_AUTOLOGIN"
 
 
@@ -127,29 +130,49 @@ def _retry_backoff() -> tuple:
     return () if os.environ.get(_ENV_NO_RETRY) else _RETRY_BACKOFF
 
 
-def _heal(name: str) -> bool:
-    """静默刷新凭据（headless / 不等人 / 硬超时 / 子进程隔离）。
+_login_procs: dict = {}
 
-    刻意吞掉所有异常：自愈是**尽力而为**，失败时应当让原始异常照常抛出，
-    而不是把"刷新失败"变成新的错误类型。
+
+def _spawn_login(name: str) -> None:
+    """凭据失败的自愈：**非阻塞**拉起对应的 login.py（后台自愈契约）。
+
+    契约（与 `_wrap_heal` 配合）：
+      * 失败**立刻**把原始错误返回给系统 —— 调用方不等登录；
+      * login 在后台独立跑（detached，stdin 断开，日志进 autologin.log）；
+      * 后台登录**成功也不回填**本次结果（不补返回、不重试）——
+        下一次调用凭据就绪了自然恢复。
+    每个 provider 至多一个 login 进程在跑；本函数吞掉一切异常（绝不覆盖原始错误）。
     """
     if os.environ.get(_ENV_OFF):
-        return False
+        return
+    p = _login_procs.get(name)
+    if p is not None and p.poll() is None:
+        return                                  # 已有一个在跑，不重复拉起
     try:
-        from .login import silent_refresh      # 延迟 import：避免 provider ↔ login 循环依赖
+        login = Path(__file__).resolve().parent / "login.py"
+        logf = Path.home() / ".local" / "share" / "fp" / "webai" / "autologin.log"
+        logf.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.Popen(
+            [sys.executable, str(login), name],
+            stdout=logf.open("a", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _login_procs[name] = proc
+        print(f"[webai] {name} 凭据失效 → 后台自愈: login.py {name} (pid={proc.pid})",
+              file=sys.stderr)
     except Exception:  # noqa: BLE001
-        return False
-    try:
-        return bool(silent_refresh(name))
-    except Exception:  # noqa: BLE001
-        return False
+        pass
 
 
 def _wrap_heal(name, fn):
-    """两条自愈通道，互不串门：
+    """两条通道，互不串门：
 
-    * **AUTH** → 静默刷新凭据（headless）→ 成功则**立刻**重试，不退避
-      （刷新本身就是那几秒等待）；只刷一次，避免打转。
+    * **AUTH** → 立即把失败交回系统（不阻塞、不重试），同时**非阻塞**拉起
+      `login.py <name>` 后台自愈 —— 后台成功也**不回填**本次结果。
+      契约来自用户指定："失败时先返回系统；尝试自动愈合：非阻塞地调用对应的
+      login；成功了也不返回。"
     * **TRANSIENT** → 退避重试 `_RETRY_BACKOFF` 次（网络断流 / 5xx / 读超时）。
 
     ⚠️ 重试**不是幂等**的：provider 若不能在重发时复用同一份请求体
@@ -160,15 +183,14 @@ def _wrap_heal(name, fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
         attempt = 0
-        healed = False
         while True:
             try:
                 return fn(*a, **kw)
             except Exception as e:  # noqa: BLE001
                 kind = _kind_of(name, e)
-                if kind == ErrorKind.AUTH and not healed and _heal(name):
-                    healed = True
-                    continue
+                if kind == ErrorKind.AUTH:
+                    _spawn_login(name)
+                    raise                     # 立即返回失败，登录在后台跑
                 backoff = _retry_backoff()
                 # `no_retry`：provider 已经自己重发过（或用重发也治不了，如 WAF 挑战）。
                 # 不认这个标记就会形成"内层重发 × 外层重发"的乘法，白打一串请求。
@@ -186,8 +208,63 @@ def _wrap_heal(name, fn):
     return wrapper
 
 
+# ── 负载均衡：**仅**限制同一后端"新建会话"的频率 ──────────────────
+# 其它调用（ask / search / available…）一概不管；不做跨后端分发。
+# 间隔按后端风险各自配置，env `FP_WEBAI_NS_INTERVAL_<NAME>` 秒级覆盖，0=不限；
+# `FP_WEBAI_NO_BALANCE=1` 整体关闭（调试/测试用）。
+# deepseek 维持 60（2026-09-25 用户确认）：解除的是它独有的"每日配额/强制间隔"
+# 惩罚性限制（已删），此常规建会话间隔不属区别对待，保留原值。
+
+_NS_INTERVAL = {"deepseek": 60.0, "qwen": 30.0, "glm": 30.0, "stepfun": 30.0}
+_ENV_NS_OFF = "FP_WEBAI_NO_BALANCE"
+_ns_lock = threading.Lock()
+_ns_last: dict = {}
+
+
+def _ns_interval(name: str) -> float:
+    if os.environ.get(_ENV_NS_OFF):
+        return 0.0
+    env = os.environ.get(f"FP_WEBAI_NS_INTERVAL_{name.upper()}")
+    if env is not None:
+        try:
+            return max(0.0, float(env))
+        except ValueError:
+            pass
+    return float(_NS_INTERVAL.get(name, 30.0))
+
+
+def _wrap_new_session(name, fn):
+    """同一后端两次 new_session 之间至少间隔 _ns_interval(name) 秒。
+
+    * 时间戳在**调用前**登记：失败的建会话尝试同样计数（限的是"尝试频率"，
+      这才是风控在意的量）；
+    * 等待期在锁外 sleep，多线程安全；等待可见（stderr 留痕）。
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        interval = _ns_interval(name)
+        if interval > 0:
+            while True:
+                with _ns_lock:
+                    now = time.time()
+                    wait = _ns_last.get(name, 0.0) + interval - now
+                    if wait <= 0:
+                        _ns_last[name] = now
+                        break
+                print(f"[webai] 负载均衡: {name} 新建会话限速，等待 {wait:.0f}s",
+                      file=sys.stderr)
+                time.sleep(min(wait, interval))
+        return fn(*a, **kw)
+
+    return wrapper
+
+
 class _HealingProvider:
-    """provider 模块的透明包装：AUTH 失败时静默刷新 + 重试一次。
+    """provider 模块的透明包装，两件事都挂在**唯一入口** get() 上：
+
+    * **AUTH** → 立即失败返回 + 后台非阻塞 login.py 自愈（成功不回填）
+    * **new_session** → 负载均衡：同一后端新建会话限速（其它方法一概不管）
 
     其余属性**原样转发**，所以它仍然"长得像"那个模块
     （capabilities / models / available / 常量都能取到）。
@@ -204,8 +281,11 @@ class _HealingProvider:
 
     def __getattr__(self, k):
         v = getattr(object.__getattribute__(self, "_mod"), k)
+        name = object.__getattribute__(self, "_name")
+        if k == "new_session" and callable(v):
+            return _wrap_new_session(name, v)
         if k in _HEAL_METHODS and callable(v):
-            return _wrap_heal(object.__getattribute__(self, "_name"), v)
+            return _wrap_heal(name, v)
         return v
 
     def __setattr__(self, k, v):
@@ -348,9 +428,12 @@ def probe(name: str, capability: str = "") -> dict:
     }
 
 
-# 默认优先级：deepseek 优先（默认不带思考，简单问答明显快），其余按注册序兜底。
+# 默认优先级：mimo 首选 → deepseek → glm → stepfun → qwen（2026-09-25 用户指定）。
+# deepseek 走安全后端（真 Chrome），封号问题已彻底修复（2026-09-25 确认），
+# 节流与限次已全部解除（后端 pacing 移除、_NS_INTERVAL 置 0）。
+# + 负载均衡限速，观察窗口由用户此次排序指令解除，升入池内第二位。
 # 凭据未就绪的会被跳过 —— 避免"默认后端 token 一过期就整体不可用"。
-DEFAULT_ORDER = ("deepseek", "qwen", "glm", "stepfun")
+DEFAULT_ORDER = ("mimo", "deepseek", "glm", "stepfun", "qwen")
 
 
 def first_available(capability: str = "", order=None):
@@ -379,6 +462,29 @@ def first_available(capability: str = "", order=None):
             return n, tried
         tried.append(f"{n}:{why}")
     return "", tried
+
+
+# 轮询游标：留空自动时让 search 调用在四家之间轮流，避免压力连续集中同一家。
+# （first_available 是固定优先级；next_available 从上次命中的后一个开始挑。）
+_rotate_last: str | None = None
+
+
+def next_available(capability: str = "", order=None) -> tuple[str, list]:
+    """轮询版 first_available：从上次成功命中的后一家开始按序挑可用者。
+
+    首次调用等价于 first_available；之后每家轮一次。全部不可用时返回
+    ("", tried)，不推进游标（下次仍从原位置继续）。
+    """
+    global _rotate_last
+    base = [n for n in (order or DEFAULT_ORDER) if n in _MODULES]
+    base += [n for n in _MODULES if n not in base]
+    if _rotate_last in base:
+        i = base.index(_rotate_last)
+        base = base[i + 1:] + base[:i + 1]
+    name, tried = first_available(capability, order=base)
+    if name:
+        _rotate_last = name
+    return name, tried
 
 
 def available() -> dict:

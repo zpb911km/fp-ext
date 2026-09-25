@@ -450,8 +450,21 @@ def coerce_reply(raw: Any, *, provider: str = "", session_id: str = "", kind: st
     if raw.get("job"):
         r.job = coerce_job(raw["job"], provider=provider, session_id=r.session_id)
     elif raw.get("task_id"):
+        # ⚠️ 别只传 id/status：provider 为轮询**特意返回**的 kind / assets / progress /
+        #    extra 在这里被丢过一次 —— 结果 `job.kind` 恒空、首帧进度看不见。
+        #    调用方显式给的 `kind` 仍然优先（coerce_job 里 `kind or raw.get(...)`）。
         r.job = coerce_job(
-            {"id": raw["task_id"], "status": raw.get("task_status") or "running"},
+            {
+                "id": raw["task_id"],
+                "status": raw.get("task_status") or "running",
+                "kind": raw.get("kind"),
+                "assets": raw.get("assets"),
+                "progress": raw.get("progress"),
+                "extra": raw.get("extra"),
+                "note": raw.get("message") or raw.get("note"),
+                "message_id": raw.get("message_id"),
+                "model": raw.get("model"),
+            },
             provider=provider,
             session_id=r.session_id,
             kind=kind,

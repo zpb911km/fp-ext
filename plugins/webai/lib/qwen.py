@@ -14,7 +14,7 @@ Qwen provider (chat.qwen.ai)
 靠 `chat_type` / `sub_chat_type` 区分。⚠️ 能力是**会话级属性**（`chats/new` 时就定了），
 不是每条消息能切 —— 见 PROVIDER_SPEC.md §7 与 DESIGN.md §4.5。
 
-凭据：<数据目录>/webai/qwen/cookie 或环境变量 QWEN_COOKIE（与 ask_llm / vision 共用）。
+凭据：<数据目录>/webai/qwen/cookie 或环境变量 QWEN_COOKIE（ask_llm / copilot 共用）。
 """
 
 import json
@@ -33,7 +33,7 @@ except Exception:                       # noqa: BLE001  被当独立模块加载
     _core = None
 
 name = "qwen"
-capabilities = {"chat", "search", "vision"}
+capabilities = {"chat", "search", "vision", "attach"}
 default_model = "qwen3.7-plus"
 
 API_BASE = "https://chat.qwen.ai"
@@ -182,6 +182,44 @@ def _snippet(s, n: int = 300) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
+def _raise_for_ret(body: str) -> None:
+    """业务级收口：HTTP 200 但 `ret` 报错。
+
+    ⚠️ 这类响应**最容易被静默吞掉** —— HTTP 层完全正常，`_json()` 拿到一个
+    "合法的 dict"，调用方读 `data.task_id` 得到空串，于是表现成
+    "任务提交了但没有 task_id"（实测 t2v 就是这么坏的：反爬挑战
+    `FAIL_SYS_USER_VALIDATE` 返回 200 + captcha URL，被当成空成功）。
+
+    与 WAF 同理：风控挑战**不是抖动也不是凭据问题**，重发只会喂风控、
+    抬高风险分 → 一律标 no_retry（见 `_no_retry`）。
+    """
+    head = (body or "").lstrip()
+    if not head.startswith("{") or '"ret"' not in head:
+        return
+    try:
+        j = json.loads(head)
+    except ValueError:
+        return
+    if not isinstance(j, dict):
+        return
+    ret = j.get("ret")
+    if not isinstance(ret, (list, tuple)) or not ret:
+        return
+    if not any("FAIL" in str(x).upper() for x in ret):
+        return
+    msg = str(ret[1]) if len(ret) > 1 else str(ret[0])
+    low = (msg + " " + str(j.get("data") or "")).lower()
+    if "captcha" in low or "user_validate" in low or "punish" in low:
+        raise _no_retry(_new_error(
+            "auth",
+            "qwen 触发人机验证（风控挑战）：需在浏览器里过一次验证码。"
+            "重发无益 —— 与 cookie/请求头无关。",
+            raw=_snippet(body, 400),
+        ))
+    kind = _core.classify_text(msg, raw=j).value if _core else "unknown"
+    raise _new_error(kind or "unknown", f"API 拒绝：{msg}", raw=_snippet(body, 400))
+
+
 def _raise_for(r, body: str) -> None:
     """HTTP 层收口：WAF 挑战 / 非 2xx。不返回，只在出错时抛。"""
     if _is_waf(body):
@@ -194,6 +232,7 @@ def _raise_for(r, body: str) -> None:
             f"HTTP {r.status_code}：{_snippet(body, 300)}",
             raw=_snippet(body, 400),
         )
+    _raise_for_ret(body)
 
 
 def _json(r, what: str) -> dict:
@@ -752,10 +791,11 @@ def ask(
 
 # ── 便捷：一次性联网搜索 ────────────────────────────────────────
 
-def search(query: str, *, think: bool = False, model: str = "") -> dict:
+def search(query: str, *, think: bool = False, model: str = "",
+           files: list | None = None) -> dict:
     """新会话 + 开搜索，返回 {text, references, queries}"""
     sid = new_session(model)
-    r = ask(sid, query, model=model, think=think, search=True)
+    r = ask(sid, query, model=model, think=think, search=True, files=files)
     # 原样带上 ask() 的**所有**键（含将来新增的），只补 session_id。
     # 之前这里手写 5 个键 —— 新增的 assets/phases/model/extra 会被静默丢掉，
     # 正是"未知的东西不能丢"在 search() 边界上被违反。

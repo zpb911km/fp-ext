@@ -92,14 +92,19 @@ GET /api/v2/task/status/496149f7-03a7-401d-8b4e-de7a036cb254
 
 ---
 
-## 2. 结论一：**不存在"独立端点"**
+## 2. 结论一：**抽象落在「能力」层**（但端点并非全都相同 —— 已修正）
 
-Qwen 用 `chat_type` 参数、GLM 用 `assistant_id`，两家的生成能力都走**和普通聊天完全相同的端点**。
+Qwen 用 `chat_type` 参数、GLM 聊天/生图用 `assistant_id`，两者确实走**和普通聊天完全相同的端点**。
 
-> 曾经以为 GLM 有 `drawing-api` / `video-api` 独立端点 —— 错。
-> `drawing-api/v1/drawing/config` 只是个**配置** GET，生成走 `assistant/stream`。
+> ~~曾经以为 GLM 有 `drawing-api` / `video-api` 独立端点 —— 错。~~
+> **2026-09 修正：`video-api` 是真的。** 上面这句结论**只对聊天/生图成立**。
+> 前端点「AI生视频」后根本不发 `assistant/stream`，而是
+> `POST /chatglm/video-api/v1/chat` → `chat_id` → `GET …/chat/status/<chat_id>`（Playwright 实测）。
+> 当时误判的原因：只抓到 `drawing-api/v1/drawing/config` 这个**配置** GET，就推断整族不存在。
+> 教训：**"没抓到" ≠ "不存在"** —— 要点进真实入口把整条交互跑一遍才有资格下否定结论。
 
-→ **抽象必须落在「能力」层，不能落在「端点」层**，否则每家一套，永远统一不了。
+→ 结论不变的部分：**抽象仍必须落在「能力」层，不能落在「端点」层** ——
+否则每家一套，永远统一不了。端点层的差异（同端点 vs 独立端点）由 provider 内部消化。
 
 ---
 
@@ -268,7 +273,7 @@ ErrorKind = AUTH | QUOTA | UNSUPPORTED | TRANSIENT | CONTENT_POLICY | UNKNOWN
 | 模型清单 | `GET /chatglm/agent-api/operation/detail?tag=available_models` |
 | 普通聊天 | `assistant/stream` + `assistant_id=65940acff94777010aa6b796` |
 | 生图 | `assistant/stream` + `assistant_id=65a232c082ff90a2ad2f15e2` + `meta_data.cogview` |
-| 生视频 | `assistant_id=668d03b2e99d661ed3c32516`（**未实测**） |
+| 生视频 | **`video-api/v1/` 独立端点族**（2026-09 实测，见 §2 修正）：`POST …/chat` → `chat_id` → `GET …/chat/status/<id>` 轮询 → `video_url` |
 | 其他助手 | AI阅读 `658a7988b8a9a98d38725745` · 学习搭子 `68f0b8c110eea3e78b0e0e5e` |
 
 ### DeepSeek / StepFun
@@ -299,7 +304,14 @@ ErrorKind = AUTH | QUOTA | UNSUPPORTED | TRANSIENT | CONTENT_POLICY | UNKNOWN
 
 ## 8. 未验证 / 待办
 
-- [ ] GLM 生视频（`assistant_id=668d03b2e99d661ed3c32516`）是否同为同步 SSE？
+- [x] GLM 生视频形态已实测（2026-09）→ **不是同步 SSE，是独立端点 + 轮询**：
+      `POST /chatglm/video-api/v1/chat`（`base_parameter_extra` 抄前端）→ `chat_id`
+      → `GET …/chat/status/<chat_id>` 每 6s 轮询（`status: init→processing→finished`，
+      `plan:"44%"` 是进度）→ `video_url`（真 mp4，`video/mp4` 2.6MB 实测可达）。
+      `chat/list` 是**免费**的任务列表（字段名是 `id` 不是 `chat_id`），可用来查历史任务。
+      ⚠️ **生成消耗积分**（视频额度），提交要省着测；轮询/列表不花钱。
+- [ ] Qwen `t2v` 提交被反爬拦（`FAIL_SYS_USER_VALIDATE` + captcha URL，HTTP 200）——
+      需人工在浏览器过一次人机验证；`_raise_for_ret` 已改为诚实抛 `auth`+`no_retry`（不再静默空成功）
 - [ ] GLM 的 PPT / 深度研究 / 海报 / 数据分析（`engine_*` 模式）形态未知
 - [ ] `web_dev` 的「部署」按钮走什么接口（可能产出真实 URL）—— 未抓
 - [ ] `artifacts` 容器下还有哪些 sub 能力 —— 未枚举

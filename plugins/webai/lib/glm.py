@@ -41,7 +41,7 @@ import uuid
 import requests
 
 name = "glm"
-capabilities = {"chat", "search", "vision"}
+capabilities = {"chat", "search", "vision", "attach"}
 default_model = "glm-5.3-flash"
 
 BASE = "https://chatglm.cn"
@@ -57,18 +57,22 @@ UPLOAD_URL = f"{BASE}/chatglm/productivity-api/file/chat_upload"
 # 前端硬编码的签名盐（见 main.*.js: sign: l()(`${o}-${a}-8a1317...`)）
 SIGN_SALT = "8a1317a7468aa3ad86e997d08f3f31cb"
 
-# 生成类助手（PROVIDER_SPEC.md §1）：生成走**和聊天完全相同的端点**，
+# 生成类助手（PROVIDER_SPEC.md §1）：生图走**和聊天完全相同的端点**，
 # 靠 assistant_id 区分能力（GLM 没有 chat_type 方言）。
 IMAGE_ASSISTANT_ID = "65a232c082ff90a2ad2f15e2"   # AI 画图（生图）
-VIDEO_ASSISTANT_ID = "668d03b2e99d661ed3c32516"   # AI 生视频（未联网实测，见 DESIGN §8）
+VIDEO_ASSISTANT_ID = "668d03b2e99d661ed3c32516"   # AI 生视频（视频助手，fixed_assistant 清单在册）
 
-# 能力名 → 本家方言。GLM 的是 assistant_id，不是 chat_type —— 这一层只"如实描述方言"。
-# 生图附加参数另走请求体 `meta_data.cogview`（aspect_ratio/style/scene/rm_label_watermark），
-# 由调用方经 `new_session(..., cogview={...})` 透传。
+# ⚠️ 修正旧结论：**GLM 的视频确实走独立端点**（DESIGN §2 原写"video-api 是误认"，错）。
+# 实测（2026-09，联网 Playwright 抓包）：前端点「AI生视频」后**根本不发 assistant/stream**，
+# 而是 POST `video-api/v1/chat` 拿 chat_id，再轮询 `video-api/v1/chat/status/<chat_id>`。
+# assistant_id 在 video-api 里不用 —— 保留仅为与 fixed_assistant 清单对得上号。
+VIDEO_API = f"{BASE}/chatglm/video-api/v1"
+
+# 能力名 → 本家方言。`video: True` 是"这条会话走 video-api"的开关（ask() 读它分流）。
 CAPABILITY_MAP: dict = {
     "chat":      {"assistant_id": ASSISTANT_ID},
     "image_gen": {"assistant_id": IMAGE_ASSISTANT_ID},
-    "video_gen": {"assistant_id": VIDEO_ASSISTANT_ID},
+    "video_gen": {"video": True, "assistant_id": VIDEO_ASSISTANT_ID},
 }
 
 # 能力 / 模型清单（PROVIDER_SPEC.md §3/§4），都是只读 GET。
@@ -90,7 +94,7 @@ NEW = "new"
 _SESSION_DIALECT: dict = {}
 _MAX_SESSION_DIALECT = 512
 # 本家能消费的方言键；其余关键字一律忽略（PROVIDER_SPEC.md §7「绝不抛异常」）。
-_DIALECT_KEYS = ("assistant_id", "meta_data", "cogview")
+_DIALECT_KEYS = ("assistant_id", "meta_data", "cogview", "video", "video_params")
 
 _STREAM_TIMEOUT = 300
 
@@ -209,13 +213,151 @@ def new_session(model: str = "", capability: str = "", **dialect) -> str:
     **不认识的关键字一律忽略，绝不抛异常。**
     """
     d = {k: v for k, v in dialect.items() if k in _DIALECT_KEYS and v not in (None, "")}
-    if not d and capability:
-        d = dict(CAPABILITY_MAP.get(capability) or {})
+    # ⚠️ 两者必须**合并**，不能"给了显式方言就丢掉 capability"（旧逻辑
+    #    `if not d and capability` 正是如此）：`new_session(capability="video_gen",
+    #    video_params={…})` 会因此丢掉 `video: True` → ask() 悄悄退回
+    #    assistant/stream，请求打到**错误的端点**（静默走错，比报错难查得多）。
+    #    显式方言优先级更高（覆盖能力默认值）。
+    if capability:
+        cap = {k: v for k, v in (CAPABILITY_MAP.get(capability) or {}).items()
+               if k in _DIALECT_KEYS and v not in (None, "")}
+        if cap:
+            cap.update(d)
+            d = cap
     if d:
         token = f"{NEW}:{uuid.uuid4().hex[:12]}"
         _remember_dialect(token, d)
         return token
     return NEW
+
+
+# ── 生视频（独立端点族，实测 2026-09） ────────────────────────────
+#
+# 前端「AI生视频」的真实流量（Playwright 抓包，非推测）：
+#   POST {VIDEO_API}/chat            → {"result":{"chat_id", "conversation_id", "status":"init"}}
+#   GET  {VIDEO_API}/chat/status/<id> → {"result":{"status":"processing","plan":"44%",...}}
+#                                      → {"result":{"status":"finished","video_url":"…mp4"}}
+# 与聊天/生图**不同**：这里没有 assistant/stream，也不认 assistant_id。
+# 故 ask() 见到方言 `video: True` 就分流到这里，返回 job；产物由 poll() 收。
+
+# 前端实际提交的 base_parameter_extra（抄自抓包，逐字段对齐）。
+# duration 单位秒（默认 5s）；resolution 为枚举非分辨率数字；fps=0 表示"由服务端定"。
+_VIDEO_DEFAULTS = {
+    "generation_pattern": 1,      # 1 = 文生视频（text2video）
+    "resolution": 2,
+    "fps": 0,
+    "duration": 1,                # 前端字段名就叫 duration，实测产出 5s
+    "generation_ai_audio": 0,
+    "generation_ratio_width": 16,
+    "generation_ratio_height": 9,
+    "activity_type": 0,
+    "label_watermark": 0,
+    "generation_type": "",
+}
+
+
+def _snip(s: str, n: int = 300) -> str:
+    s = " ".join((s or "").split())
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def _video_json(r, what: str) -> dict:
+    """video-api 的响应收口（glm 无 `_core`，按本模块约定抛 RuntimeError/AuthError）。"""
+    if r.status_code in (401, 403):
+        raise AuthError(f"GLM {what}：HTTP {r.status_code}（token 可能过期，重跑 glm_login.py）"
+                        f"：{_snip(r.text)}")
+    if r.status_code >= 400:
+        raise RuntimeError(f"GLM {what} HTTP {r.status_code}: {_snip(r.text)}")
+    try:
+        return r.json()
+    except ValueError:
+        raise RuntimeError(f"GLM {what}：响应不是 JSON：{_snip(r.text)}")
+
+
+def _video_err(j) -> None:
+    """video-api 用 `{"status":0,"message":"success"}` 表示成功 —— 非 0 即失败。"""
+    if not isinstance(j, dict):
+        raise RuntimeError(f"GLM video-api 返回非 JSON：{str(j)[:200]}")
+    st = j.get("status")
+    if st in (0, "0", None):
+        return
+    msg = str(j.get("message") or j.get("msg") or "未知错误")
+    kind = classify(text=msg, raw=j) or "unknown"
+    raise RuntimeError(f"GLM video-api 拒绝（status={st}，{kind}）：{msg}")
+
+
+def _video_ask(conv: str, text: str, params: dict) -> dict:
+    """创建视频任务 → 返回 job。**同步部分只负责提交**，产物去 poll() 拿。"""
+    extra = dict(_VIDEO_DEFAULTS)
+    extra.update({k: v for k, v in (params or {}).items() if v not in (None, "")})
+    extra["prompt"] = text
+    body = {
+        "prompt": text,
+        "conversation_id": conv or "",
+        "advanced_parameter_extra": {},
+        "base_parameter_extra": extra,
+    }
+    r = _session().post(f"{VIDEO_API}/chat", headers=_headers(), json=body,
+                        timeout=_HTTP_TIMEOUT)
+    j = _video_json(r, "video-api 提交")
+    _video_err(j)
+    res = j.get("result") if isinstance(j.get("result"), dict) else {}
+    chat_id = str(res.get("chat_id") or "")
+    if not chat_id:
+        # 拿不到 chat_id 就没有可轮询的对象 —— 诚实失败，绝不返回空 job
+        # （qwen 就是栽在"空成功"上，见 qwen._raise_for_ret）。
+        raise RuntimeError(f"GLM video-api 未返回 chat_id：{json.dumps(res, ensure_ascii=False)[:300]}")
+    return {
+        "text": "",
+        "thinking": "",
+        "message_id": "",
+        "references": [],
+        "queries": [],
+        "session_id": str(res.get("conversation_id") or conv or ""),
+        "task_id": chat_id,
+        "task_status": str(res.get("status") or "init"),
+        "status": "job",
+        "kind": "text2video",
+        "extra": {"result": res},
+    }
+
+
+def poll(job) -> dict:
+    """轮询视频任务（PROVIDER_SPEC.md §5）。`job` 可以是 dict 或 Job。"""
+    if isinstance(job, dict):
+        task_id = str(job.get("task_id") or job.get("id") or "")
+    else:
+        task_id = str(getattr(job, "id", "") or "")
+    if not task_id:
+        raise RuntimeError("poll() 需要 task_id（GLM 的 chat_id）")
+
+    r = _session().get(f"{VIDEO_API}/chat/status/{task_id}", headers=_headers(),
+                       timeout=_HTTP_TIMEOUT)
+    j = _video_json(r, "video-api 轮询")
+    _video_err(j)
+    res = j.get("result") if isinstance(j.get("result"), dict) else {}
+
+    st = str(res.get("status") or "processing")       # init | processing | finished
+    plan = str(res.get("plan") or "")                 # "44%" / "100%" / "视频生成成功"
+    video_url = str(res.get("video_url") or "")
+
+    progress = 0.0
+    m = re.match(r"(\d+(?:\.\d+)?)\s*%", plan)
+    if m:
+        progress = min(float(m.group(1)) / 100.0, 1.0)
+
+    out = {
+        "task_id": task_id,
+        "task_status": "success" if st == "finished" else st,
+        "content": video_url,
+        "progress": progress,
+        "remaining_time": "",
+        "message": str(res.get("msg") or plan or ""),
+        "kind": "video",
+    }
+    if video_url:
+        out["assets"] = [{"kind": "video", "url": video_url}]
+    return out
 
 
 # ── 发消息 ──────────────────────────────────────────────────────
@@ -234,6 +376,14 @@ def ask(session_id: str, text: str, *, parent_message_id=None, model: str = "",
         * status: 仅当识别到"能力在追问确认"时填 "needs_input"
     """
     conv, dialect = _resolve_dialect(session_id)
+
+    # ── 视频分流 ────────────────────────────────────────────────
+    # GLM 的视频**不走** assistant/stream（DESIGN §2 旧结论已证伪）：前端点「AI生视频」
+    # 后发的是 POST video-api/v1/chat → 拿 chat_id → 轮询 chat/status/<chat_id>。
+    # 故这里返回一个 job（`task_id` 即 chat_id），产物由 `poll()` 收。
+    if dialect.get("video"):
+        return _video_ask(conv, text, dialect.get("video_params") or {})
+
     assistant_id = str(dialect.get("assistant_id") or ASSISTANT_ID)
     body = {
         "assistant_id": assistant_id,
@@ -279,29 +429,58 @@ def ask(session_id: str, text: str, *, parent_message_id=None, model: str = "",
 
 
 def _content(text: str, files=None) -> list:
-    """图片内容的 schema（实测抓包得来，与直觉差别很大）：
+    """消息 content 的 schema（实测得来，与直觉差别很大）：
 
-        {"type": "image", "image": [{file_name, file_id, image_url, file_size, order, width, height}]}
+    图片：{"type": "image", "image": [{file_name, file_id, image_url, file_size, order, width, height}]}
+        `image` 是**数组**、`image_url` 是**字符串**（不是 {"url":...} 对象）。
+        猜过的 image_url 对象式全部被服务端静默忽略（模型回"看不到图片"）。
+    文件：{"type": "file", "file": [{file_id, file_url, file_name, file_size, order, url, maxReadPercent}]}
+        2026-09 实测三路对照的唯一正解：
+          * 非图片塞进 type:"image" → **空流**（服务端静默失败）；
+          * 顶层 file_list + question_type 旁路 → 模型说"没收到文件"；
+          * 与 image 平行的 type:"file" 项（逐字复刻前端 M() 的 file_list 分支）→ 正确读出 .log 内容。
+        混图+文时 image 项与 file 项并列，order 沿用全局序号。
 
-    注意 `image` 是**数组**，且 `image_url` 是**字符串**（不是 {"url": ...} 对象）。
-    猜过的 image_url 对象式、file 类型式全部被服务端静默忽略（模型回"看不到图片"）。
+    判型走 mime/扩展名：upload() 的 ref 不带类型，文件名是唯一可靠线索。
     """
     out = [{"type": "text", "text": text}]
-    imgs = []
+    imgs, docs = [], []
     for i, f in enumerate(files or []):
         d = f if isinstance(f, dict) else {"ref": f}
-        imgs.append({
-            "file_name": d.get("name") or "image.png",
-            "file_id": d.get("ref", ""),
-            "image_url": d.get("url", ""),
-            "file_size": d.get("size", 0),
-            "order": i,
-            "width": 0,
-            "height": 0,
-        })
+        if _is_image(d):
+            imgs.append({
+                "file_name": d.get("name") or "image.png",
+                "file_id": d.get("ref", ""),
+                "image_url": d.get("url", ""),
+                "file_size": d.get("size", 0),
+                "order": i,
+                "width": 0,
+                "height": 0,
+            })
+        else:
+            docs.append({
+                "file_id": d.get("ref", ""),
+                "file_url": d.get("url", ""),
+                "file_name": d.get("name") or "file",
+                "file_size": d.get("size", 0),
+                "order": i,
+                "url": d.get("url", ""),
+                "maxReadPercent": 1,     # 小文件全读；大文件由服务端按上下文截断
+            })
     if imgs:
         out.append({"type": "image", "image": imgs})
+    if docs:
+        out.append({"type": "file", "file": docs})
     return out
+
+
+def _is_image(d: dict) -> bool:
+    """按 mime/扩展名判是不是图片 —— 无 mime（.log 等）时回落到扩展名白名单。"""
+    name = str(d.get("name") or "")
+    mime = mimetypes.guess_type(name)[0]
+    if mime:
+        return mime.startswith("image/")
+    return name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"))
 
 
 def _snap_append(acc: list, chunk: str):
@@ -582,10 +761,11 @@ def _parse(raw: bytes) -> dict:
 # ── 可选钩子：模型枚举 / 能力探测 / 错误归类（PROVIDER_SPEC.md §3/§4/§6）──
 # 原则：这些是"缺了自动降级"的可选实现 —— 一律**不往外抛异常**，拿不准就 []/None/""。
 
-_MODEL_ID_KEYS = ("model", "model_id", "model_name", "id")
+_MODEL_ID_KEYS = ("model", "selected_model", "model_id", "model_name", "id")
 _MODEL_NAME_KEYS = ("name", "display_name", "label", "title", "cn_name")
-_MODEL_MODE_KEYS = ("modes", "efforts", "levels", "reasoning", "reasoning_levels")
-_MODEL_STRONG_ID_KEYS = ("model", "model_id", "model_name")
+_MODEL_MODE_KEYS = ("modes", "efforts", "levels", "reasoning", "reasoning_levels",
+                    "reasoning_efforts")
+_MODEL_STRONG_ID_KEYS = ("model", "selected_model", "model_id", "model_name")
 _MODEL_CAP_KEYS = ("capabilities", "vision", "search", "thinking",
                    "enable_thinking", "web_search", "reasoning")
 _MODEL_CTX_KEYS = ("max_context_length", "context_length", "ctx", "max_input_tokens")
@@ -718,34 +898,79 @@ def _collect_assistant_ids(obj, out=None) -> set:
     return out
 
 
+# 助手清单端点：`operation-api/assistant_top/v4/recent_list` **已下线（404，2026-09 实测）**，
+# 前端现用 `feed-api/…`；`fixed_assistant` tag 则是「AI画图 / 视频助手」这类固定入口的权威来源。
+# 两个都留：任一可用即可判，全部失效才降级 None。
+_ASSISTANT_SOURCES = (
+    f"{BASE}/chatglm/feed-api/assistant_top/v4/recent_list",
+    f"{OPERATION_API}/config/operation_data?tag=fixed_assistant",
+    ASSISTANT_LIST_URL,          # 旧端点（现已 404），保留兜底
+)
+
+
 def probe(capability: str = "") -> dict:
-    """尽力探测某能力是否可用（权威来源：`GET /operation-api/assistant_top/v4/recent_list`）。
+    """尽力探测某能力是否可用。
+
+    * 视频 → 直接打 `video-api/v1/chat/list`（**免费 GET**，能列出即证明端点可用）。
+      这是权威探针：视频不走 assistant/stream，助手清单里有没有它都无关。
+    * 其余 → 多源助手清单（见 `_ASSISTANT_SOURCES`）。
 
     **允许返回 `{"supported": None}` —— 不知道就说不知道。** 离线 / 凭据过期时一律 None。
     """
-    out = {"supported": None, "via": "assistant_list", "note": ""}
-    try:
-        r = _session().get(ASSISTANT_LIST_URL, headers=_headers(), timeout=_HTTP_TIMEOUT)
-        out["note"] = f"HTTP {r.status_code}"
-        if r.status_code != 200:
-            return out
-        ids = _collect_assistant_ids(r.json())
-    except Exception as e:  # noqa: BLE001
-        out["note"] = f"{type(e).__name__}: {e}"[:120]
+    out = {"supported": None, "via": "", "note": ""}
+
+    # 视频：独立端点族，用它自己的列表接口做探针
+    if capability == "video_gen":
+        out["via"] = "video_api"
+        try:
+            r = _session().get(f"{VIDEO_API}/chat/list?page=1&page_size=1",
+                               headers=_headers(), timeout=_HTTP_TIMEOUT)
+            out["note"] = f"HTTP {r.status_code}"
+            if r.status_code == 200:
+                out["supported"] = True
+                out["note"] += "（chat/list 可访问 → 端点在用）"
+            elif r.status_code in (401, 403):
+                out["supported"] = False
+                out["note"] += "（凭据被拒 → 先跑 glm_login.py）"
+        except Exception as e:  # noqa: BLE001
+            out["note"] = f"{type(e).__name__}: {e}"[:120]
         return out
 
+    ids: set = set()
+    notes: list = []
+    # ⚠️ 必须**合并所有源**而不是"第一个非空就 break"：
+    #   feed-api 的 recent_list 只有「最近用过」的 3 个，fixed_assistant 才含 AI画图/视频助手。
+    #   早退会把 image_gen 误报成不支持（实测踩过）。
+    for url in _ASSISTANT_SOURCES:
+        try:
+            r = _session().get(url, headers=_headers(), timeout=_HTTP_TIMEOUT)
+            notes.append(f"{url.rsplit('/', 1)[-1][:40]}→{r.status_code}")
+            if r.status_code == 200:
+                before = len(ids)
+                ids |= _collect_assistant_ids(r.json())
+                if len(ids) > before:
+                    out["via"] = "assistant_list"
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"{type(e).__name__}"[:30])
+    out["note"] = "; ".join(notes)
     if not ids:
+        out["note"] = "助手清单全部失效：" + out["note"]
         return out
     if not capability:
-        out["note"] = f"助手清单 {len(ids)} 项"
+        out["note"] = f"助手清单（多源合并）{len(ids)} 项"
         return out
     mapping = CAPABILITY_MAP.get(capability) or {}
     aid = str(mapping.get("assistant_id") or "")
     if aid:
-        sup = aid in ids
-        return {"supported": sup, "via": "assistant_list",
-                "note": f"{capability} → assistant_id={aid}："
-                        + ("在清单中" if sup else "不在清单中")}
+        # 诚实边界：这些端点返回的是「最近/固定助手」**子集**，不是全量目录。
+        # 所以"不在清单中"只能说明**没有证据**，不能证明不支持 → 给 None 而非 False。
+        # （False 会误导调用方直接放弃一个实测可用的能力，比 None 危险得多。）
+        if aid in ids:
+            return {"supported": True, "via": "assistant_list",
+                    "note": f"{capability} → assistant_id={aid}：在清单中"}
+        return {"supported": None, "via": "assistant_list",
+                "note": (f"{capability} → assistant_id={aid}：不在所查清单中，"
+                         f"但清单仅含最近/固定助手（非全量），故不能断定不支持 → None")}
     return {"supported": None, "via": "assistant_list",
             "note": f"未知能力名 {capability}：清单里没有直接证据，故不猜。"}
 
@@ -778,9 +1003,10 @@ def classify(text: str = "", status: int = 0, raw=None, exc=None, **_) -> str:
 
 # ── 便捷：一次性联网搜索 ────────────────────────────────────────
 
-def search(query: str, *, think: bool = False, model: str = "") -> dict:
+def search(query: str, *, think: bool = False, model: str = "",
+           files: list | None = None) -> dict:
     sid = new_session(model)
-    r = ask(sid, query, model=model, think=think, search=True)
+    r = ask(sid, query, model=model, think=think, search=True, files=files)
     # 原样带上 ask() 的**所有**键（含将来新增的），只补 session_id。
     # 之前这里手写 5 个键 —— 新增的 assets/phases/model/extra 会被静默丢掉，
     # 正是"未知的东西不能丢"在 search() 边界上被违反。
@@ -792,7 +1018,12 @@ def search(query: str, *, think: bool = False, model: str = "") -> dict:
 # ── 上传（图片）────────────────────────────────────────────────
 
 def upload(path: str) -> dict:
-    """上传图片 → {ref, name, size, url}，ref/url 放进 ask(files=[...])。"""
+    """上传文件 → {ref, name, size, url}，ref/url 放进 ask(files=[...])。
+
+    端点是通用 multipart（mime 按扩展名猜，未知回落 image/png 且服务端照收）：
+    实测 .log 上传成功且模型能读 —— 图片与否只影响 _content 用哪套 schema，
+    不影响这里。
+    """
     fn = os.path.basename(path)
     data = open(path, "rb").read()
     mime = mimetypes.guess_type(fn)[0] or "image/png"

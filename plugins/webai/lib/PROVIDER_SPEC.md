@@ -119,7 +119,7 @@ phases[phase] += content        # delta 帧
 
 ## 5. `poll(job) -> dict`
 
-只有**真异步**的才需要（目前只有 qwen 的 `t2v`）。返回：
+只有**真异步**的才需要（目前：qwen 的 `t2v`、glm 的生视频）。返回：
 
 ```python
 {"task_id": job.id, "task_status": "success|processing|error",
@@ -127,6 +127,13 @@ phases[phase] += content        # delta 帧
 ```
 
 `core.coerce_job()` 会做状态名归一（`success`→`done`、`processing`→`running`）。
+
+`job` 形态要**兼容两种**：`Job` 对象（读 `.id`）和裸 dict（读 `task_id`/`id`）——
+调用方可能两头都传。带 `progress`（0~1 的 float）能顺带上报进度。
+
+⚠️ `poll()` **不该有副作用地花钱**：qwen/glm 的轮询都是免费 GET，可以放心高频调。
+真正的消耗在"提交"那一步（glm 视频**消耗积分**）—— 所以 ask() 拿不到
+`task_id` 时必须**诚实抛错**，绝不能返回空 job 让调用方以为提交成功了。
 
 ## 6. `classify(text="", status=0, raw=None) -> str`
 

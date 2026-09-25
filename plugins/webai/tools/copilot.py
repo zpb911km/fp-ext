@@ -4,8 +4,9 @@ Copilot 插件 — 把网页版 AI 抽象成 FP 的协作者
 
 三个工具的分工（provider 层已统一在 public/plugins/webai/lib/，差别只在工具语义）：
     ask_llm  = provider.search()  无状态单轮，总是联网检索，返回答案 + 引用来源
-    vision   = provider.ask()     无状态单轮，带图片附件（看图问答）
     copilot  = provider.ask()     有状态多轮（本插件）：记得上下文 / 可绑人设 / 可并行多专家
+    （vision 已取消：单轮看图由 ask_llm 的 files 承接；
+      多轮看图/读文件由本工具的 files 承接 —— 附件只上传一次，之后靠上下文续谈）
 
 多后端：
     真正的调用细节（端点、鉴权、PoW、SSE 解析）全在 public/plugins/webai/lib/ 里。
@@ -36,6 +37,7 @@ from typing import Any
 
 
 from .. import lib as _webai
+from . import _files
 
 TOOL_NAME = "copilot"
 _STORE_FILE = os.path.expanduser("~/.local/share/fp/webai/copilot/sessions.json")
@@ -76,11 +78,11 @@ def _login_advice(prov: str) -> str:
     """AUTH 场景的下一步动作。
 
     远端已收敛为**统一入口** public/plugins/webai/lib/login.py（四家各有 *_login.py，qwen 现在也有）。
-    provider 层发现 AUTH 时会先自动试一次静默刷新（headless/不等人/硬超时），
-    所以走到这里还报 AUTH，基本就是"需要人工登录"了。
+    provider 层发现 AUTH 时会**非阻塞**在后台拉起 login.py 自愈（立即失败返回，
+    登录成功也不回填本次结果），所以走到这里还报 AUTH = 本次自愈没赶上。
     """
-    return (f"已自动尝试过静默刷新；仍报此错说明需要人工登录。\n"
-            f"  刷新它：{_login_cmd(prov)}\n"
+    return (f"已在后台自动拉起登录自愈（本次仍失败）；登录完成后下次调用自动恢复。\n"
+            f"  立即手动：{_login_cmd(prov)}\n"
             f"  查全部：{_login_cmd('--check')}")
 
 
@@ -200,6 +202,8 @@ def copilot_say(
     web: bool = False,
     role: str = "",
     provider: str = "",
+    files: Any = None,
+    image_paths: Any = None,
 ) -> dict:
     """向命名会话说一句话。会话不存在则自动新建。
 
@@ -208,7 +212,13 @@ def copilot_say(
 
     model 与 provider 一样是**会话级**属性：只在建会话时生效；已有会话中途指定
     不同模型会被明确拒绝（换模型 = 让新模型接上旧模型的上下文树，语义不可靠）。
+
+    files（可选）：本轮附带的文件（图片或其它）。**只上传一次**，之后靠会话上下文
+    续谈（服务端已持有的文件不必反复传）。能力不足的后端（deepseek/mimo 不收附件）
+    会明确报错而不静默丢文件。`image_paths` 是旧名（v1.2.0），仍接受。
     """
+    if files is None:
+        files = image_paths                      # 旧名兼容
     with _LOCK:
         rec = _get_session_rec(session) or {}
 
@@ -275,6 +285,16 @@ def copilot_say(
     if rec.get("role") and not rec.get("history"):
         payload = f"【角色设定】{rec['role']}\n\n{message}"
 
+    # ── 附件：只在本轮上传（服务端持有的不重复传）──
+    # 失败必须中止，不能"没文件也照发" —— 用户以为文件已提交、模型却看不到，
+    # 会答非所问且不留任何痕迹。
+    refs = None
+    if files:
+        refs, ferr = _files.upload_files(prov, files)
+        if ferr:
+            return {"success": False, "session": session, "error": ferr}
+        refs = refs or None
+
     try:
         out = p.ask(
             rec["chat_id"],
@@ -283,6 +303,7 @@ def copilot_say(
             model=rec.get("model", model),
             think=think,
             search=web,
+            files=refs,
         )
     except Exception as e:  # noqa: BLE001
         return {"success": False, "error": _explain(prov, e), "session": session}
@@ -322,7 +343,11 @@ def copilot_say(
     rec["provider"] = rec.get("provider", prov)
     rec["updated"] = int(time.time())
     hist = rec.setdefault("history", [])
-    hist.append({"role": "user", "content": message, "ts": int(time.time())})
+    uentry = {"role": "user", "content": message, "ts": int(time.time())}
+    if files:                            # 记下附过件，否则 history 看不出当时带了附件
+        pth = files if isinstance(files, list) else [files]
+        uentry["files"] = [str(x) for x in pth]
+    hist.append(uentry)
     hist.append({"role": "assistant", "content": answer, "ts": int(time.time())})
     rec["history"] = hist[-_HISTORY_CAP:]
     rec["turns"] = len(rec["history"]) // 2
@@ -404,8 +429,9 @@ DEFINITION = {
         "description": (
             "与一个有状态的网页版AI协作者进行多轮对话。它有记忆——同一个 session 里后续追问会记得之前聊过什么。"
             "适合：复杂问题探讨、方案评审、结对思考、需要连续多轮的协作。"
-            "边界：查资料的一次性检索请用 ask_llm（它总是联网搜索）；"
-            "看懂一张图请用 vision（本工具目前不接受图片、文件附件）。"
+            "边界：查资料的一次性检索请用 ask_llm（它总是联网搜索）。"
+            "带 files 可让它看图/读文件（截图 / 图表 / 照片 / 文档 / 数据），"
+            "图片理解实测为真正的图像理解；附件只上传一次，之后靠上下文续谈。"
             "action: say=发消息(默认) / new=新建或重置会话(可用 role 设定人设) / list=列出所有会话 / history=查看某会话记录。"
             "不同 session 名 = 不同专家的独立记忆，可并行多个。"
             f"provider 可选 {'/'.join(_providers())} —— 不同厂商的模型，换后端等于换脑子。"
@@ -414,6 +440,15 @@ DEFINITION = {
             "type": "object",
             "properties": {
                 "message": {"type": "string", "description": "要说的话（action=say 时必填）"},
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "可选：本轮附带的文件路径（绝对路径，单张也用数组，最多 6 个）。"
+                        "只在本轮上传一次，后续追问靠上下文即可。"
+                        "不收附件的后端（deepseek/mimo）会明确报错，不会静默丢文件。"
+                    ),
+                },
                 "session": {"type": "string", "description": "会话名，默认 default。换个名字就是开一个独立记忆的新协作者"},
                 "action": {
                     "type": "string",
@@ -470,7 +505,9 @@ async def execute(params: dict[str, Any]) -> str:
         lines = [f"📜 会话 {session}（最近 {len(hist)} 条）："]
         for h in hist[-12:]:
             who = "我" if h["role"] == "user" else "AI"
-            lines.append(f"  [{who}] {h['content'][:160]}")
+            att = h.get("files") or h.get("images")     # "images" 是 v1.2.0 旧记录的键
+            tag = f" 📎×{len(att)}" if att else ""
+            lines.append(f"  [{who}]{tag} {h['content'][:160]}")
         return "\n".join(lines)
 
     if action == "new":
@@ -489,12 +526,16 @@ async def execute(params: dict[str, Any]) -> str:
         return "错误：action=say 需要 message 参数"
 
     res = await loop.run_in_executor(
-        None, copilot_say, message, session,
-        params.get("model", ""),
-        bool(params.get("think", False)),
-        bool(params.get("web", False)),
-        params.get("role", ""),
-        params.get("provider", ""),
+        None,
+        lambda: copilot_say(
+            message, session,
+            params.get("model", ""),
+            bool(params.get("think", False)),
+            bool(params.get("web", False)),
+            params.get("role", ""),
+            params.get("provider", ""),
+            params.get("files") or params.get("image_paths"),   # 旧名 image_paths 兼容
+        ),
     )
     if not res.get("success"):
         return f"❌ copilot 失败：{res.get('error')}"
