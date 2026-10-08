@@ -40,10 +40,15 @@ except Exception:  # noqa: BLE001
 
 # provider → (凭据文件, 破坏方式)
 CASES = {
-    "qwen":     (DATA / "webai" / "qwen" / "cookie", "text"),
-    "deepseek": (DATA / "webai" / "deepseek" / "token", "text"),
+    # 2026-10：qwen 鉴权从 cookie 迁到 localStorage 的落盘文件 → 破坏 token 文件
+    "qwen":     (DATA / "webai" / "qwen" / "token", "text"),
     "stepfun":  (DATA / "webai" / "stepfun" / "cookies.json", "json_values"),
     "glm":      (DATA / "webai" / "glm" / "cookies.json", "json_values"),
+}
+
+# 契约上就不联网的 verify()：垃圾凭据不该影响结果，本脚本测不了它们。
+SKIP = {
+    "deepseek": "verify()=本地自检（profile 在即 ok，不联网）—— 坏 token 由实调 AUTH 抛错兜底",
 }
 
 
@@ -71,6 +76,10 @@ def main() -> int:
 
     login = importlib.import_module("login")
     names = [n.lower() for n in a.providers] or list(CASES)
+    for n in names:                                  # 显式点名 SKIP 里的要说明，别静默漏掉
+        if n in SKIP:
+            print(f"{n:9} 跳过（{SKIP[n]}）")
+    names = [n for n in names if n not in SKIP]
     fails = []
     for name in names:
         cf, how = CASES[name]
@@ -106,7 +115,7 @@ def main() -> int:
         print(f"❌ {len(fails)} 家未通过：{', '.join(fails)} —— 它们的 verify() 需要用"
               f"**真的需要鉴权**的调用做探针（参考 qwen 改用 new_session()）。")
         return 1
-    print("✅ 全部通过：四家的 verify() 都能识破无效凭据。")
+    print("✅ 全部通过：各家 verify() 都能识破无效凭据（SKIP 的除外，见上方说明）。")
     return 0
 
 

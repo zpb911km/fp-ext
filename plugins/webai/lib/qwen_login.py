@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import sys
 import time
 
@@ -38,6 +39,7 @@ except Exception:  # noqa: BLE001
 ROOT = DATA / "webai" / "qwen"
 PROFILE = ROOT / "profile"
 COOKIE_FILE = ROOT / "cookie"            # 整条 cookie 串（原 <数据目录>/webai/qwen/cookie）
+TOKEN_FILE = ROOT / "token"              # localStorage 的 JWT（2026-10 起鉴权靠它，不再是 cookie）
 CRED_FILE = ROOT / "credentials.json"    # 可选账密（原 <数据目录>/webai/qwen/credentials.json）
 WAIT_SECONDS = 600
 SILENT_SECONDS = 12
@@ -66,11 +68,26 @@ def read_cookie(ctx) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in jar)
 
 
+def read_token(page) -> str:
+    """localStorage 的 token —— 2026-10 起 qwen 把鉴权从 cookie 迁到了这里。"""
+    try:
+        return (page.evaluate("() => localStorage.getItem('token')") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _looks_logged_in(page, cookie: str) -> bool:
-    """判定是否已登录：不在 /auth 页，且 cookie 里带了 token。"""
+    """判定是否已登录：不在 /auth 页，且有真 token。
+
+    ⚠️ cookie 判据必须精确匹配 `token=` —— 早版本用子串 `"token" in cookie.lower()`
+    会被 `refresh_token` 命中造成假阳性（profile 里 refresh_token 长期残留 →
+    永远报"已登录"，实际 Bearer token 早没了 → API 401）。
+    """
     if "/auth" in (page.url or ""):
         return False
-    return bool(cookie) and "token" in cookie.lower()
+    if read_token(page):
+        return True
+    return bool(re.search(r"(?:^|;\s*)token=", cookie or ""))
 
 
 def _try_password_login(page, email: str, pwd: str) -> bool:
@@ -153,6 +170,13 @@ def main(headless: bool = False, wait_seconds: int = WAIT_SECONDS) -> int:
         COOKIE_FILE.write_text(cookie)
         COOKIE_FILE.chmod(0o600)
         print(f"cookie 已写入 {COOKIE_FILE}（{len(cookie)} 字符）")
+        token = read_token(page)
+        if token:
+            TOKEN_FILE.write_text(token)
+            TOKEN_FILE.chmod(0o600)
+            print(f"token 已写入 {TOKEN_FILE}（{len(token)} 字符）")
+        else:
+            print("⚠️ localStorage 里没有 token —— API 鉴权会失败（稍后重跑本脚本）")
         ctx.close()
     return 0
 

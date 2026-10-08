@@ -43,6 +43,7 @@ USER_AGENT = (
 )
 
 _COOKIE_FILE = os.path.expanduser("~/.local/share/fp/webai/qwen/cookie")
+_TOKEN_FILE = os.path.expanduser("~/.local/share/fp/webai/qwen/token")
 _HTTP_TIMEOUT = 30
 _STREAM_TIMEOUT = 300
 
@@ -94,15 +95,28 @@ def load_cookie() -> str:
         return ""
 
 
+def load_token() -> str:
+    """Bearer token —— 2026-10 起 qwen 把鉴权从 cookie 迁到了 localStorage。
+    登录器把 localStorage 的 token 落盘到 <数据目录>/webai/qwen/token。"""
+    t = os.environ.get("QWEN_TOKEN", "")
+    if t:
+        return t
+    try:
+        with open(_TOKEN_FILE) as f:
+            return f.read().strip()
+    except (FileNotFoundError, PermissionError):
+        return ""
+
+
 def available():
-    if not load_cookie():
-        return False, "未找到 Qwen cookie：<数据目录>/webai/qwen/cookie 或环境变量 QWEN_COOKIE"
+    if not load_token():
+        return False, "未找到 Qwen token：<数据目录>/webai/qwen/token 或环境变量 QWEN_TOKEN（跑 login.py qwen 生成）"
     return True, ""
 
 
 def _headers() -> dict:
     """完整浏览器头 —— 缺项会被 WAF 拦成 HTML 挑战页"""
-    return {
+    h = {
         "User-Agent": USER_AGENT,
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
@@ -117,6 +131,10 @@ def _headers() -> dict:
         "sec-ch-ua-platform": '"Linux"',
         "sec-fetch-site": "same-origin",
     }
+    tok = load_token()
+    if tok:                            # 鉴权已迁 localStorage → 必须带 Bearer（2026-10 实测）
+        h["Authorization"] = f"Bearer {tok}"
+    return h
 
 
 def _session() -> requests.Session:
