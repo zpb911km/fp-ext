@@ -40,8 +40,6 @@ except Exception:  # noqa: BLE001
 
 # provider → (凭据文件, 破坏方式)
 CASES = {
-    # 2026-10：qwen 鉴权从 cookie 迁到 localStorage 的落盘文件 → 破坏 token 文件
-    "qwen":     (DATA / "webai" / "qwen" / "token", "text"),
     "stepfun":  (DATA / "webai" / "stepfun" / "cookies.json", "json_values"),
     "glm":      (DATA / "webai" / "glm" / "cookies.json", "json_values"),
 }
@@ -49,6 +47,11 @@ CASES = {
 # 契约上就不联网的 verify()：垃圾凭据不该影响结果，本脚本测不了它们。
 SKIP = {
     "deepseek": "verify()=本地自检（profile 在即 ok，不联网）—— 坏 token 由实调 AUTH 抛错兜底",
+    # 2026-10：qwen 也改成了浏览器后端（WAF 把所有纯 HTTP 通道拦死）。
+    # 登录态在 browser profile 里，cookie/token 文件已与请求路径无关 ——
+    # 破坏它们不会改变 verify()。活性验证请跑：
+    #     python3 lib/qwen_safe_backend/backend.py probe
+    "qwen":     "verify()=本地自检（profile 在即 ok，不联网）—— 活体验证走 backend.py probe",
 }
 
 

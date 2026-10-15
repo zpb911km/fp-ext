@@ -297,7 +297,7 @@ ErrorKind = AUTH | QUOTA | UNSUPPORTED | TRANSIENT | CONTENT_POLICY | UNKNOWN
 | GLM `output_image_hw` 是 `[高,宽]` | 名字骗人 |
 | GLM 没有建会话 API | 传 `""` 让服务端在首帧返回 `conversation_id`；自造 id → HTTP 200 但响应 0 字节 |
 | **`phase` 白名单漏项 = 静默丢产物** | 已知 phase 就有 7 个；`slides` 的产物全在 `phase:"slides"` 帧里 |
-| **Qwen 有阿里云 WAF** | 纯 HTTP 客户端直连 `completions` 会被 `_____tmd_____/punish?x5secdata=…` 拦（浏览器有反爬 token）。轮询类 GET 反而没事 |
+| **Qwen 有阿里云 WAF** | 纯 HTTP 客户端直连 `completions` 会被 `_____tmd_____/punish?x5secdata=…` 拦。**2026-10 起升级**：不再限轮询/直连，所有纯 HTTP 通道（含 curl_cffi 伪造 TLS + bx-ua 头）都被 `RGV587_ERROR` 拒，且 js 挑战**只有有头浏览器跑得完** → qwen 已整体迁到 `qwen_safe_backend`（真实浏览器后端），与 deepseek 同构。详见 `qwen_safe_backend/README.md` |
 | slides 第二轮 252s | 加草案轮共约 5.5 分钟，超时设置要够 |
 
 ---
