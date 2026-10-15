@@ -31,6 +31,13 @@
 > `ask()` 经 `--files` 透传（CLI 解析与 rpc 载荷**两处都要有**，漏 rpc 曾致
 > files:0 静默丢件）；文件 × 搜索互斥强制关搜并给 warnings（前端 v9 同款规则）；
 > 实测 .md 逐字读出 + 紫底绿三角描述正确。
+> v1.6.0：qwen 改走**浏览器安全后端**（`lib/qwen_safe_backend/`，playwright chromium +
+> Xvfb :99 懒启动 daemon，只操作 DOM）——2026-10 chat.qwen.ai 对
+> `/api/v2/chat/completions` 上了阿里 WAF，纯 HTTP 通道（requests / curl_cffi /
+> 补 cookie / 拷 bx-ua）全被 `RGV587_ERROR` 拦，且 bx 挑战**只有有头渲染**跑得完
+> （headless 永久卡在 `response-loading`）。代价是能力声明收紧：
+> `capabilities={chat,search}`、`CAPABILITY_MAP` 为空（t2i/t2v/slides/deep_research
+> 未实现，不许吹）；`qwen.verify()` 退化为 profile 自检。
 """
 
 from __future__ import annotations
@@ -55,7 +62,7 @@ class WebAIPlugin(Plugin):
     """网页版 AI 多后端：一次注册 ask_llm / copilot。"""
 
     name = "webai"
-    version = "1.5.0"
+    version = "1.6.0"
 
     def __init__(self, config: PluginConfig | None = None):
         super().__init__(config)
