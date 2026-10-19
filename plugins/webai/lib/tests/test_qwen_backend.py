@@ -15,7 +15,8 @@
   §2 会话新鲜度：new_session() 后的首次 ask 必须开新对话
   §3 错误收口：后端的 err 必须变成异常，且 classify() 能归类（风控→auth）
   §4 附件是延迟引用（本地路径透传，不在 provider 层伪造上传）
-  §5 能力声明诚实：没实测的不许声明（CAPABILITY_MAP 空 / probe 里 supported=False）
+  §5 能力声明诚实：没实测的不许声明（probe 里 supported=False + 理由）
+  §6 浏览器 DOM 驱动面齐全（离线静态检查：多级模型菜单/模式芯片/子配置/风控自停）
 """
 
 import importlib.util
@@ -164,33 +165,123 @@ def test_upload_deferred(webai):
 
 
 def test_capability_honesty(webai):
-    print("== §5 能力声明诚实 ==")
+    """2026-10-19 能力补全后的契约：方言、透传、诚实声明（离线，绝不拉浏览器）。"""
+    print("== §5 能力声明诚实（能力补全版契约）==")
     q = webai.raw("qwen")
-    chk(q.capabilities == {"chat", "search"},
-        f"capabilities 只声明实测过的 chat/search（实测 {sorted(q.capabilities)}）")
-    chk(q.CAPABILITY_MAP == {}, "CAPABILITY_MAP 为空（生成类能力未实现，不许吹）")
-    chk(q.models() == [], "models() 返回 []（浏览器后端不切页面模型）")
+    chk({"chat", "search"} <= q.capabilities,
+        f"capabilities 至少含 chat/search（实测 {sorted(q.capabilities)}）")
     pr = q.probe()
-    chk(pr["chat"]["supported"] is True and pr["search"]["supported"] is True,
-        "probe(): chat/search 标 True")
-    chk(pr["vision"]["supported"] is False, "probe(): 未实测的 vision 标 False")
+    declared = {k for k, v in pr.items() if v.get("supported")}
+    chk(q.capabilities <= declared,
+        f"capabilities 不得超出 probe 支持集（{sorted(q.capabilities)} ⊄ {sorted(declared)}）")
+    # CAPABILITY_MAP：五项旧通道生成能力 + 三个页面新增模式 + search；
+    # 值方言统一 {mode: 菜单条目 id}（backend PLUS_MODES 翻译）
+    want = {"t2i", "t2v", "slides", "web_dev", "deep_research",
+            "preview", "study", "travel", "search"}
+    chk(set(q.CAPABILITY_MAP) == want,
+        f"CAPABILITY_MAP 键 = {sorted(want)}（实测 {sorted(q.CAPABILITY_MAP)}）")
+    chk(all(set(v) == {"mode"} for v in q.CAPABILITY_MAP.values()),
+        "方言值全是 {mode: ...}（backend PLUS_MODES 翻译约定）")
+    # models()：stub 掉后端，只验解析（离线测试绝不允许真拉浏览器）
+    payload = {"ok": True, "current": "Qwen3.7-Plus", "models": [
+        {"id": "Qwen3.7-Plus", "name": "Qwen3.7-Plus", "capabilities": [],
+         "ctx": 0, "default": True},
+        {"id": "Qwen3.8-Max", "name": "Qwen3.8-Max", "capabilities": [],
+         "ctx": 0, "default": False}]}
+    old, q._run_backend = q._run_backend, (lambda args, wait: payload)
     try:
-        q.new_session(capability="t2i")
-        chk(False, "不支持的能力必须抛（不能静默降级）")
+        ms = q.models()
+    finally:
+        q._run_backend = old
+    chk([m["name"] for m in ms] == ["Qwen3.7-Plus", "Qwen3.8-Max"],
+        "models() 解析后端 models 载荷为 dict 清单")
+    chk(isinstance(ms[0]["capabilities"], set) and ms[0]["default"] is True,
+        "models() 条目规整 capabilities:set / default:bool")
+    # new_session：已支持能力登记会话模式；未知能力点名抛（不静默降级）
+    sid = q.new_session(capability="t2i", mode="t2i")
+    chk(q._SESSION_MODE.get(sid) == "t2i", "t2i 会话登记 mode=t2i")
+    try:
+        q.new_session(capability="holo_deck")
+        chk(False, "未知能力必须抛（不能静默降级）")
     except Exception as e:  # noqa: BLE001
-        chk("t2i" in str(e), "不支持的能力报错里点名能力名")
-    # 后端入口存在且可编译
+        chk("holo_deck" in str(e), "不支持的能力报错里点名能力名")
+    # ask() 把 model/think/mode 透传给后端 CLI
+    fake = FakeBackend(OK_RESULT)
+    old2, q._run_backend = q._run_backend, fake
+    try:
+        q.ask(q.new_session(), "你好", model="Qwen3.8-Max", think=True)
+        q.ask(q.new_session(capability="t2i", mode="t2i"), "画只猫")
+    finally:
+        q._run_backend = old2
+    call0, call1 = fake.calls[0], fake.calls[1]
+    chk("--model" in call0 and "Qwen3.8-Max" in call0, "ask() 透传 --model")
+    chk("--think" in call0, "ask() 透传 --think")
+    chk("--mode" in call1 and "t2i" in call1, "会话能力 → ask() 透传 --mode")
+    chk(str(q._MODE_TIMEOUT["t2i"]) in call1, "生成模式放宽 --timeout")
+    # 后端源码：有头 + 新驱动入口都在
     chk(q.BACKEND.exists(), f"安全后端在: {q.BACKEND}")
     src = q.BACKEND.read_text(encoding="utf-8")
     compile(src, str(q.BACKEND), "exec")
     chk("headless=False" in src, "后端是有头启动（headless 过不了 WAF 挑战）")
+    for marker in ("wms-trigger", "mode-select-open", "生成图像", "深入研究",
+                   "自动", "思考", "快速", "PLUS_MODES", "SLOW_MODES"):
+        chk(marker in src, f"后端含 {marker!r} 驱动")
+
+
+def test_backend_dom_drivers(webai):
+    """§6 浏览器后端的 DOM 驱动面必须齐全（离线静态检查，不开浏览器）。
+
+    这一节守的是「页面逆向知识有没有被改丢」：多级模型菜单、模式芯片、
+    子配置下拉、风控自停、产物三类（图/视频/附件卡）。
+    """
+    print("== §6 浏览器 DOM 驱动面（离线静态检查）==")
+    q = webai.get("qwen")
+    src = q.BACKEND.read_text(encoding="utf-8")
+    compile(src, str(q.BACKEND), "exec")
+
+    # 多级模型菜单：一级 + 「展开更多模型」hover 出的二级
+    chk("wms-more-entry" in src, "模型菜单含「展开更多模型」二级入口")
+    chk("wms-popup--secondary" in src, "模型菜单读二级面板 .wms-popup--secondary")
+    chk("pin_model" in src, "模型「设为默认」驱动在（pin_model）")
+    chk("_model_menu_open" in src, "模型菜单用 aria-expanded 判开合（不靠盲点）")
+
+    # 模式：芯片是唯一状态源，退出靠芯片 X
+    chk("mode-select-current-mode" in src, "模式芯片 .mode-select-current-mode")
+    chk("mode-select-current-mode-close" in src, "芯片关闭钮（退出模式）")
+    chk("def current_mode" in src and "def exit_mode" in src, "current_mode/exit_mode 都在")
+    chk("mode-select-sub-popover-container" in src, "「更多」二级子菜单容器")
+    chk('"preview": "预览模式"' in src and '"travel": "旅行规划师"' in src,
+        "加号菜单二级三项（预览模式/学习/旅行规划师）已登记")
+
+    # 子配置（比例/分辨率/研究深度）
+    chk("def read_config" in src and "def set_config" in src, "子配置读写驱动在")
+    chk("def mode_config_options" in src, "子配置选项枚举在")
+
+    # 风控自保：DOM 级检测 + 轮询中也查
+    chk("def risk_state" in src and "def guard" in src, "DOM 级人机验证检测（risk_state/guard）")
+    chk('self.guard("ask:poll")' in src, "等待回答的轮询里也会查风控（命中即停手）")
+
+    # 产物：图/视频/文件/附件卡都给
+    for key in ('"images"', '"videos"', '"files_out"', '"attachments"'):
+        chk(key in src, f"结果含 {key}")
+    chk("attachment-card-container" in src, "附件卡（网页开发/幻灯片产物）有读取")
+    chk("qwen-chat-thinking-and-sources-content" in src,
+        "思考正文取「思考与搜索」面板（不是老 class）")
+    chk("PASTE_THRESHOLD" in src, "长文本走粘贴式 fill（逐字敲会撞动作超时）")
+
+    # 模式清单一致性：provider 的能力键必须在 backend PLUS_MODES 里可翻译
+    for cap, dialect in q.CAPABILITY_MAP.items():
+        mode = (dialect or {}).get("mode", "")
+        if cap == "search":
+            continue
+        chk(f'"{mode}"' in src, f"能力 {cap} 的模式键 {mode!r} 在 backend 里有对应")
 
 
 # ── runner ────────────────────────────────────────────────────
 
 
 TESTS = [test_ask_contract, test_error_funnel, test_upload_deferred,
-         test_capability_honesty]
+         test_capability_honesty, test_backend_dom_drivers]
 
 
 def main():

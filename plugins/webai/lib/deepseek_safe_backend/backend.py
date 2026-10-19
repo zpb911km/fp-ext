@@ -44,6 +44,8 @@ ASKS_LOG = HERE / "asks.log"
 STATE = HERE / "state.json"
 
 ASK_TIMEOUT = 300          # 单问等待上限(秒)
+PASTE_THRESHOLD = 600      # 超过这么多字改用 fill 一次性写入：逐字敲 18~45ms/字
+                           # 会在 ~900 字处撞 Playwright 默认 30s 动作超时（2026-10 实测）
 IDLE_SEC = 3600            # 无操作自动关闭(秒)
 XVFB_DISPLAY = ":99"
 XVFB_SCREEN = "1920x1080x24"
@@ -95,12 +97,20 @@ class BrowserBackend:
         if not _xvfb_alive():
             if _ensure_xvfb():
                 os.environ["DS_XVFB_OWNED"] = "1"
+        os.environ["DISPLAY"] = XVFB_DISPLAY
+        # ⚠️ KDE/Wayland 会话里 WAYLAND_DISPLAY 会被继承下来, chrome 优先走 wayland
+        # ozone → 连不上 Xvfb(:99) → 秒退, playwright 只报 "Target page, context or
+        # browser has been closed"(2026-10-18 实测根因)。
+        os.environ.pop("WAYLAND_DISPLAY", None)
         self._pw = sync_playwright().start()
         self.ctx = self._pw.chromium.launch_persistent_context(
             str(PROFILE),
             executable_path=str(CHROME),
             headless=False,
             args=[
+                # KDE/Wayland 会话: chrome 见 WAYLAND_DISPLAY/XDG_SESSION_TYPE=wayland
+                # 就去连 wayland(虚拟屏 :99 上没有) → 秒退。钉死 x11 ozone 后端。
+                "--ozone-platform=x11",
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -202,6 +212,43 @@ class BrowserBackend:
         log(f"uploaded {len(got)} file(s)")
         return len(got)
 
+
+    @staticmethod
+    def _bulk_input(box, text: str) -> str:
+        """长文本一次性写入，返回实际生效的方式（fill / js / insert / type）。"""
+        try:
+            box.fill(text)
+            if (box.input_value() or "") == text:
+                return "fill"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            box.evaluate(
+                """(el, t) => {
+                  const p = el instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                  Object.getOwnPropertyDescriptor(p, 'value').set.call(el, t);
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                }""",
+                text,
+            )
+            if (box.input_value() or "") == text:
+                return "js"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            box.click()
+            box.page.keyboard.insert_text(text)
+            if (box.input_value() or "") == text:
+                return "insert"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            box.fill("")
+        except Exception:  # noqa: BLE001
+            pass
+        return "type"
+
     def ask(self, text: str, timeout: int = ASK_TIMEOUT, *,
             new_chat: bool = False, search: bool = False,
             files: list | None = None) -> dict:
@@ -233,12 +280,20 @@ class BrowserBackend:
 
         box = self.page.locator(SELECTOR_INPUT).first
         box.click()
-        # 打字机输入, jitter 更接近人类
-        box.press_sequentially(text, delay=random.randint(18, 45))
+        # 长文本一次性写入；逐字敲 18~45ms/字 会撞 30s 动作超时
+        sent_via = "type"
+        if len(text) > PASTE_THRESHOLD:
+            sent_via = self._bulk_input(box, text)
+        if sent_via == "type":
+            # 打字机输入, jitter 更接近人类；超时按长度放大
+            box.press_sequentially(
+                text, delay=random.randint(18, 45),
+                timeout=max(30_000, int(len(text) * 60)),
+            )
         self.page.wait_for_timeout(random.randint(400, 900))
         box.press("Enter")
         sent_at = time.strftime("%H:%M:%S")
-        log(f"sent @{sent_at} len={len(text)}")
+        log(f"sent @{sent_at} len={len(text)} via={sent_via}")
 
         changed = False
         last, stable, polls = pre, 0, 0
@@ -539,6 +594,7 @@ def _connect(retry: int = 20) -> socket.socket:
         owned = _ensure_xvfb()
         env = dict(os.environ)
         env["DISPLAY"] = XVFB_DISPLAY
+        env.pop("WAYLAND_DISPLAY", None)   # 见 BrowserBackend 里同款注释
         env["DS_XVFB_OWNED"] = "1" if owned else ""
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "daemon"],

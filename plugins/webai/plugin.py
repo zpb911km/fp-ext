@@ -62,7 +62,7 @@ class WebAIPlugin(Plugin):
     """网页版 AI 多后端：一次注册 ask_llm / copilot。"""
 
     name = "webai"
-    version = "1.6.0"
+    version = "1.7.0"
 
     def __init__(self, config: PluginConfig | None = None):
         super().__init__(config)
