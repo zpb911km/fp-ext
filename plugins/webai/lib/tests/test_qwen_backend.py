@@ -20,6 +20,7 @@
 """
 
 import importlib.util
+import json
 import os
 import sys
 
@@ -277,11 +278,92 @@ def test_backend_dom_drivers(webai):
         chk(f'"{mode}"' in src, f"能力 {cap} 的模式键 {mode!r} 在 backend 里有对应")
 
 
+def test_video_params_and_semantics(webai):
+    """§7 创建视频参数弹层 + 语义子配置键（离线静态检查 + 透传契约）。
+
+    守两件 2026-10-19 逆向出来的硬事实：
+      * 视频参数**不是下拉**，是 `.video-params-popover` 的 radio 组（清晰度/编辑模式/比例/时长）
+      * 输入区子配置必须能按**语义键**（ratio/model/depth）改，不能只认 index
+    """
+    print("== §7 视频参数弹层 / 语义子配置 ==")
+    q = webai.get("qwen")
+    src = q.BACKEND.read_text(encoding="utf-8")
+    compile(src, str(q.BACKEND), "exec")
+
+    for marker in ("video-params-summary", "video-params-popover", "video-params-group",
+                   "video-params-segment-label", "video-params-vip-badge"):
+        chk(marker in src, f"后端含视频参数弹层选择器 {marker!r}")
+    for fn in ("def video_params_summary", "def read_video_params",
+               "def set_video_params", "def configs_semantic", "def _cfg_key"):
+        chk(fn in src, f"后端有驱动 {fn!r}")
+    chk("VIDEO_PARAM_KEYS" in src and "VIDEO_KEY_ALIAS" in src,
+        "组标题→语义键映射在（清晰度/视频编辑模式/比例/时长）")
+    chk("allow_vip" in src, "VIP 档有显式开关（默认拒绝，点了只会弹升级）")
+    chk('_cfg_key' in src and '"ratio"' in src and '"depth"' in src,
+        "语义键推导覆盖 ratio/depth")
+    # ask 里视频参数必须在**发送前**生效（页面按当前参数计费）
+    i_vp = src.index("video_cfg = self.set_video_params(vparams)")
+    i_send = src.index("box.press(\"Enter\")")
+    chk(i_vp < i_send, "vparams 在点发送之前设置（计费按当前参数）")
+
+    # provider 层透传：setcfg / vset / vparams / mode / think
+    calls = []
+
+    def fake(args, wait):
+        calls.append(list(args))
+        return {"ok": True, "answer": "ok", "value": "1:1", "mode": "创建视频",
+                "thinking": "思考", "summary": "720P · 5s",
+                "current": {"clarity": "720P", "ratio": "1:1"},
+                "options": {"ratio": [{"label": "1:1", "checked": True, "vip": False}]},
+                "semantic": [{"index": 1, "key": "ratio", "label": "1:1"}],
+                "vparams": {"ratio": "1:1"}, "video_summary": "720P · 5s"}
+
+    old, q._run_backend = q._run_backend, fake
+    try:
+        q.ask(q.new_session(), "下雨的东京街头", mode="t2v",
+              vparams={"ratio": "1:1", "duration": "10s"})
+        call_ask = calls[-1]
+        chk("--vparams" in call_ask, "ask() 透传 --vparams")
+        vp = json.loads(call_ask[call_ask.index("--vparams") + 1])
+        chk(vp == {"ratio": "1:1", "duration": "10s"},
+            f"--vparams 是合法 JSON（实测 {vp}）")
+        q.set_config("1:1", key="ratio")
+        chk(calls[-1][:2] == ["setcfg", "1:1"] and "--key" in calls[-1]
+            and "ratio" in calls[-1], "set_config 按语义键下发 setcfg --key")
+        q.set_video_params(clarity="720P", duration="10s")
+        chk(calls[-1][0] == "vset" and "--clarity" in calls[-1]
+            and "--duration" in calls[-1], "set_video_params 下发 vset 各键")
+        chk("--allow-vip" not in calls[-1], "VIP 默认不放行")
+        vp2 = q.video_params()
+        chk(vp2.get("summary") == "720P · 5s" and "ratio" in (vp2.get("current") or {}),
+            "video_params() 解析摘要 + 当前值")
+        cfg = q.configs()
+        chk("semantic" in cfg and "video" in cfg, "configs() 带 semantic 与 video 两组")
+        m = q.set_mode("t2v")
+        chk(calls[-1][:2] == ["mode", "t2v"] and m.get("mode"), "set_mode 下发 mode（不发消息）")
+        t = q.set_thinking("thinking")
+        chk(calls[-1][:2] == ["think", "thinking"] and t.get("thinking"),
+            "set_thinking 下发 think（不发消息）")
+    finally:
+        q._run_backend = old
+
+    # 诚实：页面上存在但做不到的入口必须写进 probe，且不进 capabilities
+    pr = q.probe()
+    chk(pr.get("video_params", {}).get("supported") is True,
+        "video_params 已活体验收 → supported=True")
+    for k in ("tools_menu", "call"):
+        chk(pr.get(k, {}).get("supported") is False,
+            f"{k} 不声明（实测无效果/不在范围）")
+        chk(k not in q.capabilities, f"{k} 不进 capabilities")
+    chk("VIP" in pr["video_params"]["note"], "video_params 的 note 写明 VIP 档限制")
+
+
 # ── runner ────────────────────────────────────────────────────
 
 
 TESTS = [test_ask_contract, test_error_funnel, test_upload_deferred,
-         test_capability_honesty, test_backend_dom_drivers]
+         test_capability_honesty, test_backend_dom_drivers,
+         test_video_params_and_semantics]
 
 
 def main():

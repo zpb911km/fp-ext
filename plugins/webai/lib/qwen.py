@@ -169,6 +169,7 @@ def ask(
     search: bool = False,
     files: list | None = None,
     mode: str = "",
+    vparams: dict | None = None,
     retries: int = 1,
     retry_delay: int = 15,
     **kwargs,
@@ -178,7 +179,9 @@ def ask(
 
     model：页面左上角下拉选（页面名或旧 API id，模糊匹配）；
     think：思考档切「思考」；mode/会话模式：加号菜单选生成模式
-    （t2i/t2v/slides/web_dev/deep_research）。
+    （t2i/t2v/slides/web_dev/deep_research）；
+    vparams：创建视频的页内参数 {"clarity","vmode","ratio","duration"}
+    （点发送前设置，页面按当前参数计费）。
     """
     mode = mode or _SESSION_MODE.get(session_id, "")
 
@@ -202,6 +205,8 @@ def ask(
         args += ["--mode", mode]
     if model:
         args += ["--model", model]
+    if vparams:
+        args += ["--vparams", json.dumps(vparams, ensure_ascii=False)]
     if paths:
         args += ["--files", *paths]
     if session_id in _FRESH:
@@ -224,6 +229,9 @@ def ask(
                 # 页面侧真实状态（浏览器通道独有）：模式芯片、子配置取值
                 "mode": res.get("mode") or "",
                 "configs": res.get("configs") or [],
+                # 创建视频的实参（清晰度/编辑模式/比例/时长）+ 页面摘要文案
+                "vparams": res.get("vparams") or {},
+                "video_summary": res.get("video_summary") or "",
             }
             # 生成物 → assets（core.coerce_assets 认 kind+url 字典）
             assets = [{"kind": "image", "url": u} for u in res.get("images") or []]
@@ -246,6 +254,8 @@ def ask(
                 extra["mode"] = res["mode"]
             if res.get("configs"):
                 extra["configs"] = res["configs"]
+            if res.get("vparams"):
+                extra["vparams"] = res["vparams"]
             if res.get("pending"):
                 # 异步产物（t2v）：提交成功、视频还在生成 → 用 assets() 轮询同一对话
                 extra["pending"] = True
@@ -318,16 +328,88 @@ def pin_model(name: str) -> dict:
 
 
 def configs() -> dict:
-    """读当前模式的子配置（比例/分辨率/研究深度…）与全部可选值。
+    """读当前模式的全部可调项（语义键 + 全部可选值）。
 
-    返回 {"mode": "生成图像", "thinking": "自动",
-          "configs": [{"index":0,"value":"Qwen-Image 2.0","options":[...]}, ...]}
+    返回 {"mode":"创建视频", "thinking":"自动",
+          "configs":[{"index":0,"key":"model","value":"HappyHorse 1.1","options":[...]}],
+          "semantic":[{"index","key","label","rect"}],
+          "video":{"summary":"720P · 5s",
+                   "current":{"clarity":"720P","vmode":"视频生成","ratio":"16:9","duration":"5s"},
+                   "options":{"clarity":[{"label":"720P","checked":true,"vip":false}, ...]}}}
     """
     res = _run_backend(["configs"], wait=240)
     if not res.get("ok"):
         raise RuntimeError(str(res.get("err") or "读取子配置失败"))
     return {"mode": res.get("mode", ""), "thinking": res.get("thinking", ""),
-            "configs": res.get("configs") or []}
+            "configs": res.get("configs") or [],
+            "semantic": res.get("semantic") or [],
+            "video": res.get("video") or {}}
+
+
+def set_config(value: str, *, key: str = "", index: int = 0) -> dict:
+    """改输入区子配置（`key` 优先于 `index`）。key ∈ ratio|model|depth。
+
+    例：set_config("1:1", key="ratio") / set_config("Qwen-Image 3.0", key="model")。
+    """
+    res = _run_backend(["setcfg", value] + (["--key", key] if key else [])
+                       + ["--index", str(index)], wait=240)
+    if not res.get("ok"):
+        raise RuntimeError(str(res.get("err") or "改子配置失败"))
+    return {"value": res.get("value", ""), "semantic": res.get("semantic") or []}
+
+
+def video_params() -> dict:
+    """读创建视频的参数（清晰度/编辑模式/比例/时长）。不在该模式 → {}。"""
+    res = _run_backend(["vparams"], wait=240)
+    if not res.get("ok"):
+        raise RuntimeError(str(res.get("err") or "读取视频参数失败"))
+    return {k: res.get(k) for k in ("summary", "current", "options")}
+
+
+def set_video_params(*, clarity: str = "", vmode: str = "", ratio: str = "",
+                     duration: str = "", allow_vip: bool = False, **kw) -> dict:
+    """改创建视频的参数（页面按当前参数计费，所以必须在发送前设）。
+
+    参数：clarity=720P|1080P(VIP) / vmode=视频生成|多参考图 /
+          ratio=16:9|4:3|1:1|3:4|9:16|原比例 / duration=5s|10s|15s
+    别名也认（分辨率/画幅/时长/编辑模式）。VIP 档默认拒绝（点它只会弹升级）。
+    """
+    want = {k: v for k, v in {"clarity": clarity, "vmode": vmode,
+                              "ratio": ratio, "duration": duration, **kw}.items() if v}
+    if not want:
+        return video_params()
+    args = ["vset"]
+    for k, v in want.items():
+        args += [f"--{k}", str(v)]
+    if allow_vip:
+        args.append("--allow-vip")
+    res = _run_backend(args, wait=240)
+    if not res.get("ok"):
+        raise RuntimeError(str(res.get("err") or "改视频参数失败"))
+    return {k: res.get(k) for k in ("summary", "current", "options")}
+
+
+def set_mode(mode: str) -> dict:
+    """切加号菜单模式（**不发消息**）。空串 / "chat" = 回普通对话。
+
+    返回 {"mode": 页面芯片文案, "configs": [...], "video": {...}}。
+    """
+    res = _run_backend(["mode", mode or "chat"], wait=300)
+    if not res.get("ok"):
+        raise RuntimeError(str(res.get("err") or "切模式失败"))
+    return {"mode": res.get("mode", ""), "configs": res.get("configs") or [],
+            "video": res.get("video") or {}}
+
+
+def set_thinking(level: str) -> dict:
+    """切思考档位（**不发消息**）：auto|thinking|fast（或 自动/思考/快速）。
+
+    ⚠️ 这是**页面级**设置（存 localStorage），新建对话不会重置。
+    """
+    res = _run_backend(["think", level], wait=240)
+    if not res.get("ok"):
+        raise RuntimeError(str(res.get("err") or "切思考档失败"))
+    return {"thinking": res.get("thinking", "")}
 
 
 def probe(capability: str = "") -> dict:
@@ -352,7 +434,14 @@ def probe(capability: str = "") -> dict:
                              "思考正文要点开「已经完成思考」卡片才在 DOM 里"},
         "t2i": {"supported": True, "via": "browser:mode",
                 "note": "「生成图像」模式；产物是 cdn 图片 URL（assets）。"
-                        "子配置：模型(Qwen-Image 3.0/2.0) + 比例(7 档)"},
+                        "子配置：模型(Qwen-Image 3.0/2.0) + 比例(7 档)，"
+                        "configs()/set_config(key='model'|'ratio') 可改"},
+        "video_params": {"supported": True, "via": "browser:popover",
+                         "note": "创建视频的参数弹层（.video-params-summary → .video-params-popover）："
+                                 "清晰度(720P/1080P·VIP) · 视频编辑模式(视频生成/多参考图) · "
+                                 "比例(16:9/4:3/1:1/3:4/9:16/原比例) · 时长(5s/10s/15s)。"
+                                 "video_params() 读、set_video_params() 改、ask(vparams=) 发送前生效；"
+                                 "VIP 档默认拒绝（点了只会弹升级）"},
         "slides": {"supported": True, "via": "browser:mode", "interactive": True,
                    "note": "「幻灯片」**交互式**：首轮只出大纲(needs_input=True)，"
                            "同一 session 再发「确认」才产出附件卡 + 预览图"},
@@ -365,6 +454,7 @@ def probe(capability: str = "") -> dict:
                                   "一次完整长任务未验收 → 暂不声明"},
         "t2v": {"supported": True, "via": "browser:mode", "async": True,
                 "note": "「创建视频」模式 + 模型子配置（HappyHorse 1.1/1.0，单条 30 积分）。"
+                        "参数（清晰度/编辑模式/比例/时长）见 video_params。"
                         "**异步**：提交即回「生成好后通知你」，实测 ~11 分钟后视频才落进对话"
                         "→ ask() 返回 extra.pending=True，再用 assets() 轮询同一条对话"},
         "preview": {"supported": False, "via": "browser:mode", "partial": True,
@@ -373,7 +463,14 @@ def probe(capability: str = "") -> dict:
                   "note": "「学习」（加号菜单→更多）可选中，产物形态未验收"},
         "travel": {"supported": False, "via": "browser:mode", "partial": True,
                    "note": "「旅行规划师」（加号菜单→更多）可选中，产物形态未验收"},
-    }
+        # ── 页面上存在但**做不到 / 无效果**的入口：如实记录，不声明能力 ──
+        "tools_menu": {"supported": False, "via": "browser:dom", "partial": True,
+                       "note": "加号菜单里的「工具」条目 2026-10-19 实测是**空入口**："
+                               "无 has-submenu 类、hover 不出子菜单、点击不产生模式芯片、"
+                               "不改 localStorage、DOM 无新增弹层。不接线、不猜测语义"},
+        "call": {"supported": False, "via": "browser:dom", "partial": True,
+                 "note": "输入框右侧图标弹层含「语音通话 / 视频通话」（WebRTC，需麦克风/摄像头），"
+                         "不在本后端范围内"}}
     if capability:
         return caps.get(capability, {"supported": None, "note": "未探测该能力"})
     return caps

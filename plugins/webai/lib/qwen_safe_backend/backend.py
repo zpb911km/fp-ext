@@ -89,6 +89,11 @@ SEL_MODE_CHIP = ".mode-select-current-mode"          # 已选模式的芯片（�
 SEL_MODE_CHIP_CLOSE = ".mode-select-current-mode-close"  # 芯片上的 X（hover 芯片才渲染）
 SEL_FILE_CHIP = ".message-input-column-file .file-card-list"
 SEL_FILE_REMOVE = "button.close-button"     # 芯片删除（aria-label=删除文件）
+# 创建视频的**参数弹层**（2026-10-19 实测：不是下拉，是独立 ant-popover）
+#   入口芯片 .video-params-summary（文案就是摘要「720P · 5s」）
+#   弹层 .video-params-popover > .video-params-group > [role=radio][aria-checked]
+#   四组：清晰度(720P/1080P+VIP) · 视频编辑模式(视频生成/多参考图) · 比例(6 档) · 时长(5s/10s/15s)
+SEL_VIDEO_SUMMARY = ".video-params-summary"
 
 # 加号菜单的模式条目：能力名 → 页面文本。前五个对应旧 API 通道的 chat_type；
 # 后三个（preview/study/travel）藏在「更多」二级菜单里，是旧通道没有的新能力。
@@ -106,11 +111,42 @@ SUBMENU_MODES = {"preview", "study", "travel"}
 NON_MODE_ITEMS = {"upload", "tools", "more"}
 # 各模式的子配置下拉标签（页面把它们渲染成输入区里的一组 .qwen-chat-v2-dropdown-menu-select）。
 # 用途：read_config() 如实汇报当前取值，set_config() 按键名改（比例/分辨率/研究深度…）。
+# ⚠️ 2026-10-19 复测修正：t2v 的「清晰度/时长/比例/编辑模式」**不是**这类下拉，
+# 而是独立弹层 .video-params-popover（见 read_video_params / set_video_params）。
 MODE_CONFIG_KEYS = {
-    "t2i": ("比例", "画幅"),      # 生成图像：模型 + 比例；比例按钮文案就是 "16:9"
-    "t2v": ("分辨率",),           # 创建视频：模型 + 720P · 5s（档位文案含 P/s）
+    "t2i": ("模型", "比例"),      # 生成图像：模型(Qwen-Image 3.0/2.0) + 比例(7 档)
+    "t2v": ("模型",),             # 创建视频：模型在输入条上，其余四项走 video params 弹层
     "deep_research": ("深度",),   # 深入研究：正常 / 高级
 }
+# 输入区下拉的**语义键**：按文案猜（模型名/VIP 档 → model；N:M 或「原比例」→ ratio；
+# 正常|高级 → depth；其余 → 序号名）。
+_RATIO_RE = None  # 惰性编译（模块级 re 已 import）
+VIDEO_PARAM_KEYS = {          # 视频参数弹层的组标题 → 语义键
+    "清晰度": "clarity", "视频编辑模式": "vmode",
+    "比例": "ratio", "时长": "duration",
+}
+VIDEO_KEY_ALIAS = {           # 调用方可能用别的说法
+    "分辨率": "clarity", "清晰度": "clarity", "resolution": "clarity",
+    "编辑模式": "vmode", "模式": "vmode", "video_mode": "vmode",
+    "画幅": "ratio", "aspect": "ratio",
+    "长度": "duration", "秒数": "duration", "seconds": "duration",
+}
+
+
+def _cfg_key(label: str) -> str:
+    """输入区下拉的语义键（页面不给 key，只能按取值形态认）。"""
+    t = (label or "").strip()
+    if not t:
+        return "cfg"
+    if ":" in t and all(c.isdigit() or c == ":" for c in t):
+        return "ratio"
+    if t in ("原比例", "自适应"):
+        return "ratio"
+    if t in ("正常", "高级"):
+        return "depth"
+    if "Image" in t or "HappyHorse" in t or t.startswith("Qwen"):
+        return "model"
+    return "cfg"
 # 思考下拉三档；THINK_ALIASES 收旧调用方的方言值。
 # ⚠️ 实测：思考档是**页面级**设置（存 localStorage），新建对话不会重置。
 THINK_LABELS = {"auto": "自动", "thinking": "思考", "fast": "快速"}
@@ -243,6 +279,8 @@ class BrowserBackend:
             "mode": self.current_mode(),
             "configs": [c.get("label", "") for c in self.read_config()],
             "thinking": self._think_label(),
+            # 视频参数摘要（不在创建视频模式时为空）
+            "video_summary": self.video_params_summary(),
             # 风控自保：命中人机验证时 supported 全 False，调用方一眼看出不能干活
             "risk": risk.get("marks") or ([risk["el"]] if risk.get("el") else []),
         }
@@ -583,7 +621,13 @@ class BrowserBackend:
                 self._applied["think"] = t
                 break
         if trig is None:
-            raise RuntimeError("找不到思考档位下拉（页面改版？）")
+            # 实测：生成类模式（生成图像/创建视频…）把输入区换成模式参数条，
+            # 「自动/思考/快速」下拉**不渲染** —— 思考档只在普通对话提供。
+            cur = self.current_mode()
+            raise RuntimeError(
+                "找不到思考档位下拉（页面改版？）" if not cur else
+                f"当前模式 {cur!r} 没有思考档下拉——思考档只在普通对话提供，"
+                f"先 set_mode('') 退出模式再设")
         if self._applied.get("think") == label:
             return label
         trig.click()
@@ -748,18 +792,41 @@ class BrowserBackend:
             }"""
         ) or []
 
-    def set_config(self, value: str, *, index: int = 0) -> str:
-        """把输入区第 index 个非思考下拉改成 value（精确匹配条目文案）。
+    def configs_semantic(self) -> list:
+        """read_config() + 语义键：调用方按名字改，不用记 index（页面顺序会变）。"""
+        out = []
+        for i, cfg in enumerate(self.read_config()):
+            label = cfg.get("label", "")
+            key = _cfg_key(label)
+            out.append({**cfg, "index": i, "key": key})
+        return out
 
-        典型用法：t2i 的 index=1 是比例（"16:9"）；t2v 的 index=0 是模型名；
-        deep_research 的 index=0 是研究深度（"正常"/"高级"）。返回改后的文案。
+    def set_config(self, value: str, *, key: str = "", index: int = 0) -> str:
+        """把输入区某个子配置改成 value（精确匹配条目文案）。
+
+        `key` 优先（ratio/model/depth，见 _cfg_key）；否则按 `index`。
+        典型：t2i 的 ratio 是「16:9」；model 是「Qwen-Image 3.0」；
+        deep_research 的 depth 是「正常/高级」。返回改后的文案。
         """
-        cfgs = self.read_config()
+        cfgs = self.configs_semantic()
         if not cfgs:
             raise RuntimeError("当前模式没有可切换的子配置")
-        if index >= len(cfgs):
-            raise RuntimeError(f"子配置只有 {len(cfgs)} 个，index={index} 越界")
-        cur = cfgs[index]
+        if key:
+            hit = [c for c in cfgs if c["key"] == key]
+            if not hit:
+                hint = ""
+                # 实测坑：Qwen-Image 3.0 不提供比例下拉（只有 2.0 有）→ 给条明路，别让人瞎猜
+                if key == "ratio" and any("3.0" in c["label"] for c in cfgs):
+                    hint = ("；提示：Qwen-Image 3.0 不提供比例，"
+                            "先 set_config('Qwen-Image 2.0', key='model')")
+                raise RuntimeError(
+                    f"当前子配置里没有 {key!r}（现有: "
+                    f"{[(c['index'], c['key'], c['label']) for c in cfgs]}）{hint}")
+            cur = hit[0]
+        else:
+            if index >= len(cfgs):
+                raise RuntimeError(f"子配置只有 {len(cfgs)} 个，index={index} 越界")
+            cur = cfgs[index]
         x, y, w, h = cur["rect"]
         self.page.mouse.click(x + w / 2, y + h / 2)
         self._jitter(700, 1200)
@@ -770,9 +837,130 @@ class BrowserBackend:
             raise RuntimeError(f"子配置 {cur['label']!r} 里没有 {value!r} 选项")
         self._jitter(700, 1200)
         now = self.read_config()
-        val = now[index]["label"] if index < len(now) else ""
-        log(f"config[{index}] {cur['label']} -> {val}")
+        val = now[cur["index"]]["label"] if cur["index"] < len(now) else ""
+        log(f"config[{cur['key']}#{cur['index']}] {cur['label']} -> {val}")
         return val
+
+    # -- 创建视频参数弹层（清晰度 / 编辑模式 / 比例 / 时长）--------
+    #
+    # 2026-10-19 实测（report15-18）：它**不是下拉**，是输入条右侧的独立 ant-popover。
+    #   入口芯片 `.video-params-summary`（文案就是摘要「720P · 5s」）
+    #   `.video-params-popover` > `.video-params-group` × 4
+    #       组名 `.video-params-group-title` = 清晰度 | 视频编辑模式 | 比例 | 时长
+    #       选项 button[role=radio][aria-checked] > .video-params-segment-label
+    #       1080P 上挂 `.video-params-vip-badge`（要 VIP；点它只会弹升级，默认拒绝）
+    # 这也是 `.qwen-chat-v2-dropdown-menu-select` 读不到它的原因。
+
+    def video_params_summary(self) -> str:
+        """不打开弹层读摘要（如 "720P · 5s"；不在创建视频模式时为空）。零风险。"""
+        try:
+            return (self.page.evaluate(
+                "() => (document.querySelector('.video-params-summary')?.innerText || '').trim()"
+            ) or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _video_pop_open(self) -> bool:
+        try:
+            return bool(self.page.evaluate(
+                """() => {const p = document.querySelector('.video-params-popover');
+                          return !!p && p.getBoundingClientRect().width > 0;}"""))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _open_video_params(self) -> bool:
+        if self._video_pop_open():
+            return True
+        chip = self.page.locator(SEL_VIDEO_SUMMARY).first
+        if chip.count() == 0:
+            return False
+        if not self._click_safe(chip):
+            return False
+        for _ in range(4):
+            self._jitter(500, 900)
+            self.guard("video_params:open")
+            if self._video_pop_open():
+                return True
+        return False
+
+    def read_video_params(self, *, close: bool = True) -> dict:
+        """读创建视频的四组参数。当前不在创建视频模式（没有该芯片）→ {}。"""
+        if not self._open_video_params():
+            return {}
+        summary = self.video_params_summary()
+        try:
+            groups = self.page.evaluate(
+                """() => {
+                  const pop = document.querySelector('.video-params-popover');
+                  if (!pop) return [];
+                  return [...pop.querySelectorAll('.video-params-group')].map(g => ({
+                    title: (g.querySelector('.video-params-group-title')?.innerText || '').trim(),
+                    options: [...g.querySelectorAll('[role=radio]')].map(b => ({
+                      label: (b.querySelector('.video-params-segment-label')?.innerText || '').trim(),
+                      checked: b.getAttribute('aria-checked') === 'true',
+                      vip: !!b.querySelector('.video-params-vip-badge')}))}));}"""
+            ) or []
+        finally:
+            if close:
+                self.page.keyboard.press("Escape")
+                self._jitter(300, 600)
+        out, raw = {}, {}
+        for g in groups:
+            key = VIDEO_PARAM_KEYS.get(g["title"], g["title"])
+            raw[key] = g
+            cur = next((o["label"] for o in g["options"] if o["checked"]), "")
+            out[key] = cur
+        return {"summary": summary, "current": out,
+                "options": {k: v["options"] for k, v in raw.items()}}
+
+    def set_video_params(self, want: dict, *, allow_vip: bool = False) -> dict:
+        """改创建视频参数。want 例：{"clarity": "1080P", "ratio": "1:1", "duration": "10s"}。
+
+        VIP 档（1080P）默认**拒绝**（点了只会弹升级，白费一次交互）：想试就 allow_vip=True。
+        """
+        kk = {(VIDEO_KEY_ALIAS.get(k, k)): v for k, v in (want or {}).items() if v}
+        if not kk:
+            return self.read_video_params()
+        if not self._open_video_params():
+            raise RuntimeError("当前不在创建视频模式（找不到 .video-params-summary）")
+        try:
+            for key, val in kk.items():
+                self.guard("video_params:set")
+                got = self.page.evaluate(
+                    """([key, want]) => {
+                      const MAP = {'clarity':'清晰度','vmode':'视频编辑模式',
+                                   'ratio':'比例','duration':'时长'};
+                      const title = MAP[key];
+                      const pop = document.querySelector('.video-params-popover');
+                      if (!pop || !title) return {err: 'no-popover-or-key'};
+                      for (const g of pop.querySelectorAll('.video-params-group')) {
+                        const t = (g.querySelector('.video-params-group-title')?.innerText || '').trim();
+                        if (t !== title) continue;
+                        for (const b of g.querySelectorAll('[role=radio]')) {
+                          const label = (b.querySelector('.video-params-segment-label')?.innerText || '').trim();
+                          if (label === want) {
+                            if (b.getAttribute('aria-checked') === 'true') return {ok: label, noop: true};
+                            if (b.querySelector('.video-params-vip-badge') && !%s)
+                              return {err: 'vip', label};
+                            b.click();
+                            return {ok: label};
+                          }
+                        }
+                        return {err: 'no-option', have: [...g.querySelectorAll(
+                            '.video-params-segment-label')].map(e => (e.innerText||'').trim())};
+                      }
+                      return {err: 'no-group'};
+                    }""" % ("true" if allow_vip else "false"),
+                    [key, val])
+                if not (got or {}).get("ok"):
+                    raise RuntimeError(f"视频参数 {key}={val!r} 设置失败: {got}")
+                self._jitter(600, 1100)
+            after = self.read_video_params(close=True)
+            return after
+        finally:
+            if self._video_pop_open():
+                self.page.keyboard.press("Escape")
+                self._jitter(200, 500)
 
     def mode_config_options(self) -> list:
         """枚举当前模式每个子配置的**全部可选项**（逐个打开读，读完关）。"""
@@ -989,7 +1177,8 @@ class BrowserBackend:
     def ask(self, text: str, timeout: int = ASK_TIMEOUT, *,
             new_chat: bool = False, search: bool = False,
             files: list | None = None, model: str = "",
-            think: bool | str = False, mode: str = "") -> dict:
+            think: bool | str = False, mode: str = "",
+            vparams: dict | None = None) -> dict:
         t0 = time.time()
         if new_chat:
             self.new_chat()
@@ -1012,10 +1201,17 @@ class BrowserBackend:
             self.set_thinking("thinking")
         elif isinstance(think, str) and think:
             self.set_thinking(think)
-        elif self._applied.get("think") == "思考":
+        elif self._applied.get("think") == "思考" and self._think_label():
+            # 只在**页面上真有该下拉**时归位：生成类模式没有思考档，
+            # 硬归位会抛错（实测 t2i 下必挂）
             self.set_thinking("auto")
         if files:
             self._upload_files(files)
+        # 视频参数（清晰度/编辑模式/比例/时长）：必须在**点发送前**设好，
+        # 页面按当前参数计费（消耗 N 积分会随之变）。
+        video_cfg = {}
+        if vparams:
+            video_cfg = self.set_video_params(vparams)
         configs = self.read_config()
 
         prev = self._read(self.page)
@@ -1123,6 +1319,9 @@ class BrowserBackend:
             "model": self.current_model(),
             "mode": self.current_mode(),
             "configs": [c.get("label", "") for c in configs],
+            # 创建视频的实参（点发送前设的）：{"clarity","vmode","ratio","duration"} + 摘要
+            "vparams": (video_cfg or {}).get("current") or {},
+            "video_summary": (video_cfg or {}).get("summary") or self.video_params_summary(),
             "elapsed": elapsed,
             "search": bool(search) or self.current_mode() == PLUS_MODES["search"],
             # 异步产物（t2v）：提交成功但视频还在生成，用 backend.py assets 轮询
@@ -1165,7 +1364,8 @@ def cmd_daemon() -> int:
             try:
                 req = json.loads(conn.recv(1 << 20).decode())
                 cmd = req.get("cmd")
-                if cmd in ("ask", "probe", "models", "pin", "configs", "assets"):
+                if cmd in ("ask", "probe", "models", "pin", "configs", "assets",
+                           "vparams", "vset", "setcfg", "mode", "think"):
                     last_act = time.time()
                 if cmd == "stop":
                     conn.sendall(json.dumps({"ok": True}).encode())
@@ -1239,8 +1439,81 @@ def cmd_daemon() -> int:
                             backend = BrowserBackend()
                             log("browser session opened")
                         out = {"mode": backend.current_mode(), "thinking": backend._think_label(),
-                               "configs": backend.mode_config_options()}
+                               "configs": backend.mode_config_options(),
+                               "semantic": backend.configs_semantic(),
+                               "video": backend.read_video_params()}
                         conn.sendall(json.dumps({"ok": True, **out},
+                                                ensure_ascii=False).encode())
+                    except Exception as e:  # noqa: BLE001
+                        conn.sendall(json.dumps({"ok": False, "err": str(e)},
+                                                ensure_ascii=False).encode())
+                    conn.close()
+                    continue
+                if cmd == "mode":
+                    try:
+                        if backend is None:
+                            backend = BrowserBackend()
+                            log("browser session opened")
+                        got = backend.set_mode(req.get("mode", ""))
+                        conn.sendall(json.dumps({"ok": True, "mode": got,
+                                                 "configs": backend.configs_semantic(),
+                                                 "video": backend.read_video_params()},
+                                                ensure_ascii=False).encode())
+                    except Exception as e:  # noqa: BLE001
+                        conn.sendall(json.dumps({"ok": False, "err": str(e)},
+                                                ensure_ascii=False).encode())
+                    conn.close()
+                    continue
+                if cmd == "think":
+                    try:
+                        if backend is None:
+                            backend = BrowserBackend()
+                            log("browser session opened")
+                        got = backend.set_thinking(req.get("level", "auto"))
+                        conn.sendall(json.dumps({"ok": True, "thinking": got},
+                                                ensure_ascii=False).encode())
+                    except Exception as e:  # noqa: BLE001
+                        conn.sendall(json.dumps({"ok": False, "err": str(e)},
+                                                ensure_ascii=False).encode())
+                    conn.close()
+                    continue
+                if cmd == "vparams":
+                    try:
+                        if backend is None:
+                            backend = BrowserBackend()
+                            log("browser session opened")
+                        out = backend.read_video_params()
+                        conn.sendall(json.dumps({"ok": True, **out},
+                                                ensure_ascii=False).encode())
+                    except Exception as e:  # noqa: BLE001
+                        conn.sendall(json.dumps({"ok": False, "err": str(e)},
+                                                ensure_ascii=False).encode())
+                    conn.close()
+                    continue
+                if cmd == "vset":
+                    try:
+                        if backend is None:
+                            backend = BrowserBackend()
+                            log("browser session opened")
+                        out = backend.set_video_params(req.get("want") or {},
+                                                       allow_vip=bool(req.get("allow_vip")))
+                        conn.sendall(json.dumps({"ok": True, **out},
+                                                ensure_ascii=False).encode())
+                    except Exception as e:  # noqa: BLE001
+                        conn.sendall(json.dumps({"ok": False, "err": str(e)},
+                                                ensure_ascii=False).encode())
+                    conn.close()
+                    continue
+                if cmd == "setcfg":
+                    try:
+                        if backend is None:
+                            backend = BrowserBackend()
+                            log("browser session opened")
+                        got = backend.set_config(req.get("value", ""),
+                                                 key=req.get("key", ""),
+                                                 index=int(req.get("index") or 0))
+                        conn.sendall(json.dumps({"ok": True, "value": got,
+                                                 "semantic": backend.configs_semantic()},
                                                 ensure_ascii=False).encode())
                     except Exception as e:  # noqa: BLE001
                         conn.sendall(json.dumps({"ok": False, "err": str(e)},
@@ -1258,7 +1531,8 @@ def cmd_daemon() -> int:
                                           files=req.get("files") or None,
                                           model=req.get("model", ""),
                                           think=req.get("think", False),
-                                          mode=req.get("mode", ""))
+                                          mode=req.get("mode", ""),
+                                          vparams=req.get("vparams") or None)
                         audit({"q_len": len(req["text"]), "ok": True,
                                "mode": res.get("mode", ""),
                                "model": res.get("model", ""),
@@ -1435,6 +1709,9 @@ def main() -> int:
     a_ask.add_argument("--mode", default="",
                        help="加号菜单模式: t2i/t2v/slides/web_dev/deep_research/"
                             "preview/study/travel/search，或页面文本")
+    a_ask.add_argument("--vparams", default="",
+                       help='创建视频参数(JSON): {"clarity":"720P","ratio":"1:1",'
+                            '"duration":"10s","vmode":"多参考图"}')
     sub.add_parser("status")
     sub.add_parser("probe", help="打开会话自检, 不发消息")
     a_models = sub.add_parser("models", help="读模型下拉全部条目(含「展开更多模型」二级, 不发消息)")
@@ -1442,6 +1719,22 @@ def main() -> int:
     a_pin = sub.add_parser("pin", help="把某模型设为默认(账号级, 会改设置)")
     a_pin.add_argument("model")
     sub.add_parser("configs", help="读当前模式的子配置(比例/分辨率/深度)+全部选项")
+    a_mode = sub.add_parser("mode", help="切加号菜单模式(不发消息)")
+    a_mode.add_argument("mode", help="t2i/t2v/slides/web_dev/deep_research/preview/"
+                                     "study/travel/search，或页面文本；chat=回普通对话")
+    a_think = sub.add_parser("think", help="切思考档位(不发消息)")
+    a_think.add_argument("level", help="auto|thinking|fast（或 自动/思考/快速）")
+    sub.add_parser("vparams", help="读创建视频的参数(清晰度/编辑模式/比例/时长)")
+    a_vset = sub.add_parser("vset", help="改创建视频的参数")
+    a_vset.add_argument("--clarity", default="", help="720P|1080P(VIP)")
+    a_vset.add_argument("--ratio", default="", help="16:9|4:3|1:1|3:4|9:16|原比例")
+    a_vset.add_argument("--duration", default="", help="5s|10s|15s")
+    a_vset.add_argument("--vmode", default="", help="视频生成|多参考图")
+    a_vset.add_argument("--allow-vip", action="store_true", help="允许选 VIP 档(会弹升级)")
+    a_setcfg = sub.add_parser("setcfg", help="改输入区子配置(按语义键或序号)")
+    a_setcfg.add_argument("value")
+    a_setcfg.add_argument("--key", default="", help="ratio|model|depth")
+    a_setcfg.add_argument("--index", type=int, default=0)
     sub.add_parser("assets", help="读当前对话最后一条回答的产物(图/视频/文件卡, 不发消息)")
     sub.add_parser("stop")
     sub.add_parser("daemon", help=argparse.SUPPRESS)
@@ -1484,10 +1777,45 @@ def main() -> int:
         res = rpc({"cmd": "configs"}, wait=240)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if res.get("ok") else 2
+    if a.cmd == "mode":
+        res = rpc({"cmd": "mode", "mode": a.mode}, wait=300)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 2
+    if a.cmd == "think":
+        res = rpc({"cmd": "think", "level": a.level}, wait=240)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 2
+    if a.cmd == "vparams":
+        res = rpc({"cmd": "vparams"}, wait=240)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 2
+    if a.cmd == "vset":
+        want = {k: v for k, v in (("clarity", a.clarity), ("ratio", a.ratio),
+                                  ("duration", a.duration), ("vmode", a.vmode)) if v}
+        if not want:
+            print(json.dumps({"ok": False, "err": "至少给一个参数"}, ensure_ascii=False))
+            return 2
+        res = rpc({"cmd": "vset", "want": want, "allow_vip": a.allow_vip}, wait=240)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 2
+    if a.cmd == "setcfg":
+        res = rpc({"cmd": "setcfg", "value": a.value, "key": a.key, "index": a.index},
+                  wait=240)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 2
     if a.cmd == "ask":
+        vp = {}
+        if a.vparams:
+            try:
+                vp = json.loads(a.vparams)
+            except json.JSONDecodeError as e:
+                print(json.dumps({"ok": False, "err": f"--vparams 不是合法 JSON: {e}"},
+                                 ensure_ascii=False))
+                return 2
         res = rpc({"cmd": "ask", "text": a.text, "timeout": a.timeout,
                    "search": a.search, "new_chat": a.new_chat, "files": a.files,
-                   "model": a.model, "think": a.think, "mode": a.mode},
+                   "model": a.model, "think": a.think, "mode": a.mode,
+                   "vparams": vp or None},
                   wait=a.timeout + 300)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if res.get("ok") else 2
