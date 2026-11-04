@@ -154,15 +154,18 @@ def _resolve_target(norm: dict, arg: str) -> tuple[str, str | tuple[str, str]]:
             return ("ok", entries[idx - 1])
         return ("err", f"序号越界：有效范围 1~{len(entries)}。`/model` 查看列表。")
 
-    # A. provider/model 精确
+    # A. provider/model 精确（按首个 "/" 分隔，模型 ID 允许含斜杠，如
+    #    silicon-flow/zai-org/GLM-5.3-Flash）。首段不是 provider 时不再硬报错，
+    #    落到 C 当作裸模型名全局匹配（org/model 风格裸名）。
     if "/" in arg_s:
         p, _, m = arg_s.partition("/")
-        if p in norm and m in norm[p].get("models", {}):
-            return ("ok", (p, m))
-        return (
-            "err",
-            f"找不到 `{arg_s}`（应为 `provider/model`，且两者都需存在于 LLM_PROVIDERS）。`/model` 查看全部。",
-        )
+        if p in norm:
+            if m in norm[p].get("models", {}):
+                return ("ok", (p, m))
+            return (
+                "err",
+                f"找不到 `{arg_s}`（应为 `provider/model`，且两者都需存在于 LLM_PROVIDERS）。`/model` 查看全部。",
+            )
 
     # B. provider 名（精确 → 唯一包含）
     pk = [k for k in norm if low == k.lower()]
