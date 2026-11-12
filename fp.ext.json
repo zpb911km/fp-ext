@@ -14,6 +14,10 @@
     "tools/codegraph": {
       "source": "codegraph",
       "updated_at": "2026-08-04T00:45:40"
+    },
+    "memory/reference/webui_filehub_protocol": {
+      "source": "reference/webui_filehub_protocol",
+      "updated_at": "2026-11-12T23:08:36"
     }
   }
 }
