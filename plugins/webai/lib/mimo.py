@@ -53,10 +53,15 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 
 # ultra speed 恒走 fastchat 通道（本 provider 即为 ultra speed 而生）
 _SVC = "/fastchat/open-apis/bot/chat"
-# 文档附件专用通道：实测 fastchat(ultra) 收下 file 载荷但模型读不到
-# （"附件未收到"）；非 fastchat + 非 ultra 模型全部读出（E1 实测 PASS），
-# 与前端抓包一致（/#/c 附文档时 completions 走非 fastchat、model=mimo-v2.6-pro）。
-_SVC_DOC = "/open-apis/bot/chat"
+# 文档附件/非 ultra 通道 —— 【2026-11-23 平台升级换代，Playwright 抓包实锤】：
+# 旧端点 /open-apis/bot/chat 已下线，打它会收到 SSE error
+# "平台升级啦，请「刷新页面」畅享更好的体验！"（非登录态问题，刷 cookie 无效）。
+# 现行前端 /#/c 一律走 POST /open-apis/react/chat，请求体形状不变
+# （msgId/conversationId/query/isEditedQuery/modelConfig/multiMedias），
+# 附件链路 genUploadInfo → parse → react/chat 三步照旧。
+# react 通道 SSE 的 message 事件为结构化 {messageType, content|reasoningContent}，
+# 不再用 think 字面标签 + NUL（fastchat/ultra 仍是老格式，_parse 兼容两者）。
+_SVC_DOC = "/open-apis/react/chat"
 _DOC_MODEL = "mimo-v2.6-pro"
 _USER = "/open-apis/user/mi/get"
 
@@ -351,6 +356,7 @@ def ask(session_id: str, text: str, *, parent_message_id=None, model: str = "",
 def _parse(raw: bytes, session_id: str = "") -> dict:
     """SSE → dict。格式：``event: X\\ndata: {...json...}\\n\\n``（标准 SSE）。"""
     text_parts: list = []
+    think_parts: list = []                  # react 通道的结构化 reasoningContent
     phases: dict = {}
     refs: list = []
     queries: list = []
@@ -370,6 +376,12 @@ def _parse(raw: bytes, session_id: str = "") -> dict:
         content = ""
         if isinstance(obj, dict):
             content = obj.get("content") or ""
+            # react 通道（/open-apis/react/chat）：message 事件结构化，
+            # 思考走 reasoningContent 字段，正文走 content 字段（2026-11-23 抓包）。
+            if event == "message":
+                rc = obj.get("reasoningContent")
+                if isinstance(rc, str) and rc:
+                    think_parts.append(rc)
         elif isinstance(obj, str):
             content = obj
         phases.setdefault(event, "")
@@ -449,7 +461,9 @@ def _parse(raw: bytes, session_id: str = "") -> dict:
 
     return {
         "text": text_only,
-        "thinking": "".join(thinking_parts),
+        # react 通道的 reasoningContent 与 ultra 通道的 think 标签段合并
+        # （两者互斥出现，不会重复计）：
+        "thinking": "".join(think_parts) + "".join(thinking_parts),
         "message_id": dialog_id or mid_fallback(),
         "references": refs,
         "queries": queries,
