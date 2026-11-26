@@ -31,7 +31,13 @@ name = "qwen"
 # 只声明逐项实测通过的能力（实测记录见 qwen_safe_backend/README.md 与 probe()）。
 # 2026-10-19 活体验收：chat / search / vision / attach 全部通过。
 capabilities = {"chat", "search", "vision", "attach"}
-default_model = "Qwen3.7-Plus"   # 页面左上角默认选中项（旧 API id qwen3.7-plus 模糊等价）
+# 2026-11-25 用户指定默认改 Qwen4-Max（页面 tier1 条目「Qwen4-Max」；该账号已用
+# backend.py pin 做过账号级「设为默认」，故新开页面左上角即 Qwen4-Max）。
+# ⚠️ 2026-11-27 实测：账号当日免费额度**整体**耗尽（Qwen4-Max / Qwen3.8-Max 都回
+# 「今日已达上限」），这是配额事实、不是代码缺陷 —— 后端已改成 8~21s 内报 quota
+# （旧实现空转 300s 报"未观测到新文本"，把配额伪装成后端坏了）。故这里仍如实记录
+# 页面实际默认模型，不因临时配额去改用户的模型偏好。
+default_model = "Qwen4-Max"
 # 能力名 → 方言：浏览器通道的方言是加号菜单条目（backend PLUS_MODES 翻译）。
 # 对齐旧 API 通道：t2i/t2v/slides/web_dev/deep_research ↔ chat_type。
 CAPABILITY_MAP = {
@@ -492,6 +498,7 @@ def assets() -> dict:
 
 def classify(text: str = "", status: int = 0, raw=None, exc=None, **_):
     """错误归类。本家方言：风控人机验证 → auth（不重试，提示过验证）；
+    额度耗尽（页面「今日已达上限/升级会员」）→ quota（不重试，换一家）；
     浏览器/daemon 卡住 → transient。其余返回空串，由 __init__ 落到通用词表。"""
     blob = (text or "") + " " + (str(exc) if exc is not None else "")
     low = blob.lower()
@@ -499,6 +506,9 @@ def classify(text: str = "", status: int = 0, raw=None, exc=None, **_):
         return "auth"
     if "登录态缺失" in blob or "profile" in low:
         return "auth"
+    if any(k in blob for k in ("上限", "额度", "升级会员", "积分", "配额")) \
+            or "quota" in low:
+        return "quota"
     if "超时" in blob or "timeout" in low:
         return "transient"
     return ""

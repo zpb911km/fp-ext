@@ -589,6 +589,10 @@ QUOTA_HINTS = (
     "rate limit", "ratelimit", "too many requests", "429", "quota", "exceeded",
     "额度", "次数已达", "频率", "请求过于频繁", "insufficient", "balance",
     "credit", "积分不足", "余额",
+    # 实测补充（2026-11-27 qwen）：额度耗尽时页面文案是
+    # `Qwen4-Max 今日已达上限，请升级会员或在上方切换其他模型继续使用。`
+    # —— 一个旧词表里的字都不含，于是被归成 unknown（该换家却提示"未知错误"）。
+    "已达上限", "今日已达", "升级会员", "daily limit", "limit reached",
 )
 
 UNSUPPORTED_HINTS = (

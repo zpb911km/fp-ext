@@ -50,8 +50,18 @@ IDLE_SEC = 3600            # 无操作自动关闭(秒)
 XVFB_DISPLAY = ":99"
 XVFB_SCREEN = "1920x1080x24"
 XVFB_PIDFILE = HERE / "xvfb.pid"
-STABLE_POLLS = 4           # 连续 N 次文本不变判定完成
+STABLE_POLLS = 4           # 连续 N 次文本不变才算完（仅在观测不到流事件时兜底用）
 POLL_EVERY = 2.5           # 轮询间隔(秒)
+# ── 完成判定的肯定式信号（2026-11-27 重做，反思58 的同源根治）────────────
+# 「文本没变 N 次」只是否定式证据：流式生成中 ≥6s 的间隙会被误判成结束（反思58 的
+# 截断），而读数取错范围时又会永不成立（本家 2026-11-26 的假超时）。真信号在网络层：
+# SSE `POST /api/v0/chat/completion` 的 requestfinished = 服务端把正文流写完了。
+# 故判定 = 流结束 + DOM 再稳 SETTLE_POLLS 轮；观测不到流事件(页面改版)才退回稳定窗口，
+# 且兜底窗口比旧值更保守。
+STREAM_URL_KEY = "/chat/completion"
+SETTLE_POLLS = 1           # 流结束后再多稳几轮（等 markdown/产物渲染落定）
+FALLBACK_STABLE_POLLS = 5  # 兜底：未观测到流事件时 N 次不变才算完（≈12.5s）
+STREAM_PROBE_SEC = 15      # 发出后多久仍没看到流请求 → 视为端点不可观测
 
 SELECTOR_INPUT = "textarea[placeholder*='DeepSeek']"
 SELECTOR_THINK = "div.ds-toggle-button:has-text('深度思考')"
@@ -122,6 +132,16 @@ class BrowserBackend:
         # 只允许单 tab, 防止隐藏态
         for pg in self.ctx.pages[1:]:
             pg.close()
+        # 流式完成观察器：只记时间戳，**不在回调里做 IO**
+        # （sync API 的回调跑在事件泵线程，回调里调 r.text() 会阻塞/死锁）。
+        self._stream_reqs: list = []      # completions 请求开始时刻
+        self._stream_done: list = []      # completions 响应结束时刻（= 服务端写完）
+        # 端点自我发现：记录所有 POST 路径，流端点改版时能从日志直接读出真端点
+        self._post_paths: list = []
+        self.page.on("request", self._rec_post_path)
+        self.page.on("request", self._on_stream_request)
+        self.page.on("requestfinished", self._on_stream_finished)
+        self.page.on("requestfailed", self._on_stream_finished)
         self.page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
         self.page.wait_for_selector(SELECTOR_INPUT, timeout=30000)
         self.page.wait_for_timeout(2000)
@@ -148,22 +168,134 @@ class BrowserBackend:
             raise RuntimeError(f"深度思考开关无法开启: {st}")
         return st
 
+    # -- 流式完成观察器（肯定式信号，见文件头 STREAM_URL_KEY 注释）--------
+
+    def _rec_post_path(self, req) -> None:
+        """记 POST 路径（去 query、去域名），诊断流端点改版用。回调里不做 IO。"""
+        try:
+            if req.method != "POST":
+                return
+            u = req.url.split("?")[0]
+            if u not in self._post_paths:
+                self._post_paths.append(u)
+                del self._post_paths[:-40]
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _post_paths_tail(self, n: int = 8) -> str:
+        return " | ".join(p.split("//")[-1][:90] for p in self._post_paths[-n:])
+
     @staticmethod
-    def _best_markdown(page) -> str:
-        # 取 innerText 最长的 markdown 根容器; 排除深度思考容器内的一切元素
+    def _is_stream(req) -> bool:
+        try:
+            return req.method == "POST" and STREAM_URL_KEY in req.url
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _on_stream_request(self, req) -> None:
+        if self._is_stream(req):
+            self._stream_reqs.append(time.time())
+
+    def _on_stream_finished(self, req) -> None:
+        if self._is_stream(req):
+            self._stream_done.append(time.time())
+
+    def _stream_reset(self) -> None:
+        self._stream_reqs.clear()
+        self._stream_done.clear()
+
+    def _stream_seen(self, since: float) -> bool:
+        return any(t >= since for t in self._stream_reqs)
+
+    def _stream_finished(self, since: float) -> bool:
+        return any(t >= since for t in self._stream_done)
+
+    @staticmethod
+    def _notice_error(notice: str, where: str) -> RuntimeError:
+        """系统提示 → 立刻抛（不再空转到超时）。分类词表见 core.classify_text。"""
+        t = (notice or "").strip()
+        low = t.lower()
+        if any(k in t for k in ("上限", "额度", "升级会员", "积分", "次数", "配额")) \
+                or "quota" in low or "limit" in low:
+            return RuntimeError(f"deepseek 额度/频率已用完（quota）：{t}")
+        if any(k in t for k in ("登录", "失效", "过期")) or "login" in low:
+            return RuntimeError(f"deepseek 登录态失效（auth）：{t}")
+        if any(k in t for k in ("繁忙", "稍后", "失败", "重试", "网络")) \
+                or "busy" in low or "retry" in low:
+            return RuntimeError(f"deepseek 服务端异常（transient）：{t}")
+        return RuntimeError(f"deepseek 页面系统提示（{where}）：{t}")
+
+    # -- 读数 -------------------------------------------------------
+
+    # 助手正文的**语义类名**（非哈希，2026-11-27 实测稳定）：
+    #   div.ds-message > div.ds-markdown.ds-assistant-message-main-content
+    # 思考块在 div.ds-think-content 里另有一份 .ds-markdown —— 别混进来。
+    SEL_ANSWER = ".ds-assistant-message-main-content"
+
+    @classmethod
+    def _read_answer(cls, page) -> dict:
+        """读**最后一条** assistant 回答（返回 {n, text, notice}）。
+
+        旧实现 `_best_markdown` 在 `[class*=markdown]` 里挑 innerText **最长**的那个：
+        同一会话里只要存在一条比新回答更长的历史回答（实测：前面一轮输出了 120 行
+        `L{n}: ok`），"最长文本"就**永不变化** → 完成判定里的 `cur != pre` 永假 →
+        死等到 300s 报"未观测到新文本"，而页面其实早就答完了（2026-11-26 截图实证）。
+        """
         return page.evaluate(
             """() => {
-              const thinkSel = '[class*=think], [class*=reasoning], [class*=thought]';
-              const els = document.querySelectorAll('[class*=markdown]');
-              let best = '';
-              for (const el of els) {
-                if (el.closest(thinkSel)) continue;
+              const els = document.querySelectorAll('.ds-assistant-message-main-content');
+              const n = els.length;
+              const last = n ? els[n - 1] : null;
+              const text = last ? (last.innerText || '').trim() : '';
+              // 系统提示/错误卡（额度耗尽、服务繁忙、登录失效）：这类消息**没有正文**，
+              // 旧逻辑当作"还没出文本"，一路空转到超时。这里捞出来交给上层立刻抛错。
+              let notice = '';
+              const kw = /上限|额度|升级会员|频繁|繁忙|登录|失效|过期|验证|网络|连接|断开|异常|错误|quota|limit|expire/i;
+              for (const el of document.querySelectorAll(
+                    '[class*=error], [class*=Error], [class*=limit], [class*=notice], [class*=toast]')) {
                 const t = (el.innerText || '').trim();
-                if (t.length > best.length) best = t;
+                if (t && t.length < 240 && kw.test(t)) { notice = t; break; }
               }
-              return best;
+              if (!notice && !text && last) {
+                // 兜底：末条既无正文、也无错误卡类名 —— 只有命中关键词的短文案才当真
+                const t = (last.innerText || '').trim();
+                if (t && t.length < 240 && kw.test(t)) notice = t;
+              }
+              return {n, text, notice};
             }"""
         )
+
+    # -- 新对话 -----------------------------------------------------
+
+    def new_chat(self) -> str:
+        """切到全新对话，并**校验真的切了**。
+
+        旧实现只点不验：`SELECTOR_NEWCHAT` 命中的是嵌套 div，点到被遮挡的外层等于没点，
+        仍留在旧会话里 → 下一问的读数被上一条长回答遮蔽（症状 = 永久超时）。
+        2026-11-27 截图实证（"点了新对话、同一会话里已累积 2 轮问答"）。
+        """
+        for attempt in (1, 2, 3):
+            if self._read_answer(self.page)["n"] == 0:
+                return self.page.url
+            btns = self.page.locator(SELECTOR_NEWCHAT)
+            if btns.count():
+                try:
+                    btns.last.click(timeout=8000)     # 最内层节点才是真按钮
+                except Exception as e:  # noqa: BLE001
+                    log(f"new_chat click failed: {str(e)[:80]}")
+            else:
+                # 兜底：回首页 = 新对话
+                self.page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
+            try:
+                self.page.wait_for_function(
+                    "() => document.querySelectorAll("
+                    "'.ds-assistant-message-main-content').length === 0",
+                    timeout=8000)
+                log("new chat opened")
+                return self.page.url
+            except Exception:  # noqa: BLE001
+                log(f"new_chat 未生效(第{attempt}次)，页面上仍有历史回答")
+        raise RuntimeError("无法开启新对话：页面上仍留有历史回答（--new-chat 失效）")
 
     def _upload_files(self, paths: list) -> int:
         """页面内上传: 只做 set_input_files, PoW/FormData/refFileIds 全部由前端
@@ -254,10 +386,7 @@ class BrowserBackend:
             files: list | None = None) -> dict:
         t0 = time.time()
         if new_chat:
-            btn = self.page.locator(SELECTOR_NEWCHAT).first
-            if btn.count():
-                btn.click()
-                self.page.wait_for_timeout(1500)
+            self.new_chat()          # 带校验：点了没生效会重试/报错，绝不静默留在旧会话
         self.ensure_thinking()
         search_blocked = False
         if files:
@@ -276,7 +405,8 @@ class BrowserBackend:
             if t.count() and t.get_attribute("aria-pressed") != "true":
                 t.click()
                 self.page.wait_for_timeout(600)
-        pre = self._best_markdown(self.page)
+        pre_st = self._read_answer(self.page)
+        pre, pre_n = pre_st["text"], pre_st["n"]
 
         box = self.page.locator(SELECTOR_INPUT).first
         box.click()
@@ -291,35 +421,70 @@ class BrowserBackend:
                 timeout=max(30_000, int(len(text) * 60)),
             )
         self.page.wait_for_timeout(random.randint(400, 900))
+        self._stream_reset()            # 必须在按下 Enter 前清空，才能只数本次的流
+        # ⚠️ send_ts 必须在 press 之前取：press 会同步派发 keydown，请求可能在
+        # `press()` 返回后的几毫秒内就发出，若在其后再取时间戳，请求时刻会**早于**
+        # send_ts，`_stream_seen()` 的 `t >= since` 就永远不成立（2026-11-27 实测：
+        # 日志出现「流事件=N」但端点明明命中，兜底路径被误触发）。
+        send_ts = time.time()
         box.press("Enter")
         sent_at = time.strftime("%H:%M:%S")
         log(f"sent @{sent_at} len={len(text)} via={sent_via}")
 
+        # ── 完成判定 ────────────────────────────────────────────────
+        # 读数永远取"最后一条 assistant 回答"（不是全页最长），新鲜度靠节点计数增长；
+        # 结束靠 SSE 流结束（肯定式信号），只有观测不到流事件时才退回稳定窗口兜底。
         changed = False
-        last, stable, polls = pre, 0, 0
+        last, stable, polls = "", 0, 0
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.page.wait_for_timeout(int(POLL_EVERY * 1000))
-            cur = self._best_markdown(self.page)
             polls += 1
-            if cur and cur != pre:
-                changed = True
-            if cur and cur == last:
-                stable += 1
-                if changed and stable >= STABLE_POLLS:
+            st = self._read_answer(self.page)
+            cur, notice = st["text"], (st["notice"] or "").strip()
+            if notice and not cur:
+                raise self._notice_error(notice, "ask:poll")     # 额度/繁忙/登录 → 立刻抛
+            fresh = st["n"] > pre_n or (cur and cur != pre)
+            if not (fresh and cur):
+                # 流已结束却还没正文：给足宽限（STREAM_PROBE_SEC）再下结论，
+                # 否则短问答里"流 2s 结束、DOM 稍后才渲染"会被误判成"被拒"。
+                if (self._stream_finished(send_ts) and polls >= 3
+                        and time.time() - send_ts > STREAM_PROBE_SEC):
+                    raise RuntimeError(
+                        "deepseek 服务端已结束但没有回答正文（疑似被拒/页面异常）: "
+                        + (notice or "无系统提示")[:200]
+                        + f"; POST端点={self._post_paths_tail()}")
+                stable, last = 0, cur
+                continue
+            changed = True
+            if cur != last:
+                stable, last = 0, cur
+                continue
+            stable += 1
+            if self._stream_finished(send_ts):
+                if stable >= SETTLE_POLLS:
                     break
-            else:
-                stable = 0
-                last = cur
+            elif (not self._stream_seen(send_ts)
+                  and time.time() - send_ts > STREAM_PROBE_SEC
+                  and stable >= FALLBACK_STABLE_POLLS):
+                log("⚠️ 未观测到 completion 流事件，退回稳定窗口兜底；"
+                    f"POST端点={self._post_paths_tail()}")
+                break
 
         answer = last if changed else ""
+        if answer:
+            # 每次成功都留一行端点快照：流端点改版时，上一行日志就能给出真端点
+            log(f"done len={len(answer)} "
+                f"流事件={'Y' if self._stream_seen(send_ts) else 'N'} "
+                f"POST端点={self._post_paths_tail(5)}")
         if not answer:
             # 超时诊断: 截图留证
             shots = HERE / "shots"
             shots.mkdir(exist_ok=True)
             p = shots / f"timeout_{int(time.time())}.png"
             self.page.screenshot(path=str(p))
-            raise RuntimeError(f"等待回答超时(未观测到新文本), 截图: {p}")
+            raise RuntimeError(f"等待回答超时(未观测到新文本), 截图: {p}; "
+                               f"POST端点={self._post_paths_tail()}")
 
         elapsed = round(time.time() - t0, 1)
         tb = self.page.evaluate(
@@ -336,13 +501,9 @@ class BrowserBackend:
         if search:
             refs = self.page.evaluate(
                 """() => {
-                  const thinkSel = '[class*=think], [class*=reasoning], [class*=thought]';
-                  let best = null, bl = 0;
-                  document.querySelectorAll('[class*=markdown]').forEach(el => {
-                    if (el.closest(thinkSel)) return;
-                    const t = (el.innerText || '').length;
-                    if (t > bl) { bl = t; best = el; }
-                  });
+                  // 取**最后一条**回答里的外链（旧实现取全页最长 markdown → 会取到历史回答）。
+                  const els = document.querySelectorAll('.ds-assistant-message-main-content');
+                  const best = els.length ? els[els.length - 1] : null;
                   if (!best) return [];
                   const out = [], seen = new Set();
                   best.querySelectorAll('a[href]').forEach(a => {

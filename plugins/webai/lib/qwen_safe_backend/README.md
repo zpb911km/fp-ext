@@ -28,7 +28,9 @@ chromium 操作真实 DOM 完成。
 | `navigator.webdriver=true` 等自动化指纹 | `--disable-blink-features=AutomationControlled`；有头渲染 |
 | headless 拿不到渲染器 → bx 挑战卡死 | **强制 `headless=False` + Xvfb `:99`**（懒启动、自愈、持有者才会回收） |
 | 反复请求把账号推到人机验证 | 间隔由插件层 `_NS_INTERVAL['qwen']=30s` 节流；出错即回收浏览器会话重开 |
-| 提取截断/串台 | 只取**最后一条** `.qwen-chat-message-assistant`；文本连续 `STABLE_POLLS` 次不变且无 `.response-loading` 才算完 |
+| 提取截断/串台 | 只取**最后一条** `.qwen-chat-message-assistant`；新鲜度靠节点计数 / 正文+产物签名变化 |
+| 流式生成被当成结束（**反思58**：模型自报 402 行、返回 31 行） | 完成判定用**肯定式信号**：SSE `POST /api/v2/chat/completions` 的 `requestfinished` = 服务端写完，再等 DOM 稳一轮；只有观测不到流事件才退回稳定窗口兜底（`FALLBACK_STABLE_POLLS=5` ≈10s；旧值 3 轮 ≈6s 太短） |
+| 额度耗尽伪装成"页面没反应" | 读数带 `notice`：命中「今日已达上限/升级会员/繁忙/登录失效」且无正文 → **立刻抛分类错误**（quota/auth/transient）。实测 2026-11-27：同一条配额提示，修复前空转 300s 报"未观测到新文本"，修复后 10~23s 报 `quota` |
 | 风险页被误当“空回答” | 监听 `/chat/completions` 响应体，命中 `RGV587/x5secdata/punish` 且从未成功 → 报**说人话**的错误（不甩锅 cookie） |
 | 静默丢东西 | 拿不到就留空（thinking / queries 不猜）；未实测的能力不声明（见 `qwen.probe()`） |
 | 页面弹人机验证 | **DOM 级检测（文案 + 选择器）命中即抛错停手**：不再点、不再发、不再重试，落 `shots/risk_*.png`；检查点覆盖点击前/发送前/每轮轮询/等产物 |

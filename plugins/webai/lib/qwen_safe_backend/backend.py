@@ -60,8 +60,20 @@ IDLE_SEC = 3600            # 无操作自动关闭(秒)
 XVFB_DISPLAY = ":99"
 XVFB_SCREEN = "1920x1080x24"
 XVFB_PIDFILE = HERE / "xvfb.pid"
-STABLE_POLLS = 3           # 连续 N 次文本不变判定完成
+STABLE_POLLS = 3           # 连续 N 次文本不变才算完（仅在观测不到流事件时兜底用）
 POLL_EVERY = 2.0           # 轮询间隔(秒)
+# ── 完成判定的肯定式信号（2026-11-27 重做 = 反思58 的根治）─────────────────
+# 旧判定是纯否定式的："连续 3 次文本不变 + 无 .response-loading ≈ 6s" 就收工。
+# 长代码/长文流式生成里 ≥6s 的间隙会被当成结束 → **截断的正文被当最终答案**返回并
+# 落进会话历史（反思58 实证：模型自报 402 行，返回只有 31 行）。
+# 真正的肯定式信号在网络层：SSE `POST /api/v2/chat/completions` 的 requestfinished
+# = 服务端把正文流写完了（实测 2026-11-27：流结束时刻与页面文本停增时刻一致）。
+# 故判定 = 流结束 + DOM 再稳 SETTLE_POLLS 轮；只有观测不到流事件(页面改版)才退回
+# 稳定窗口兜底，且兜底窗口放大到 FALLBACK_STABLE_POLLS（比旧 3 轮保守）。
+STREAM_URL_KEY = "/chat/completions"
+SETTLE_POLLS = 1                 # 流结束后再多稳几轮（等图表/产物渲染落定）
+FALLBACK_STABLE_POLLS = 5        # 兜底：未观测到流事件时 N 次不变才算完（≈10s）
+STREAM_PROBE_SEC = 15            # 发出后多久仍没看到流请求 → 视为端点不可观测
 PASTE_THRESHOLD = 600      # 超过这么多字改用粘贴式 fill：逐字敲 18~45ms/字
                            # 会在 ~900 字处撞 Playwright 默认 30s 动作超时
 
@@ -87,7 +99,7 @@ SEL_THINK_TRIGGER = ".qwen-chat-v2-dropdown-menu-select"   # 输入区「自动/
 SEL_CFG_TRIGGER = ".qwen-chat-v2-dropdown-menu-select"     # 输入区下拉（思考档 + 模式子配置共用）
 SEL_MODE_CHIP = ".mode-select-current-mode"          # 已选模式的芯片（唯一可靠的模式状态源）
 SEL_MODE_CHIP_CLOSE = ".mode-select-current-mode-close"  # 芯片上的 X（hover 芯片才渲染）
-SEL_FILE_CHIP = ".message-input-column-file .file-card-list"
+SEL_FILE_CHIP = ".message-input-column-file .file-card-list"  # 其子元素 = 每个附件卡片
 SEL_FILE_REMOVE = "button.close-button"     # 芯片删除（aria-label=删除文件）
 # 创建视频的**参数弹层**（2026-10-19 实测：不是下拉，是独立 ant-popover）
 #   入口芯片 .video-params-summary（文案就是摘要「720P · 5s」）
@@ -246,6 +258,18 @@ class BrowserBackend:
         self._waf_hits: list[str] = []
         self._ok_seen = False
         self.ctx.on("response", self._on_response)
+        # 流式完成观察器：只记时间戳，**不在回调里做 IO**（回调在事件泵线程里跑）。
+        self._stream_reqs: list[float] = []   # completions 请求开始时刻
+        self._stream_done: list[float] = []   # completions 响应结束时刻（= 服务端写完正文）
+        # 端点自我发现：记下所有 POST 路径（只记路径不带 query）。
+        # 流端点一改版，"观测不到流事件"就变成一个没法定位的黑洞（2026-11-27 实测：
+        # 日志反复报"未观测到 completions 流事件"，但没人知道页面到底请求了哪个 URL）。
+        # 有了这份清单，下次改版能直接从日志读出真端点。
+        self._post_paths: list[str] = []
+        self.page.on("request", self._rec_post_path)
+        self.page.on("request", self._on_stream_request)
+        self.page.on("requestfinished", self._on_stream_finished)
+        self.page.on("requestfailed", self._on_stream_finished)
         self.page.goto(BASE + "/", wait_until="domcontentloaded", timeout=60000)
         self.page.wait_for_timeout(4000)
         # 页面配置缓存：菜单项多为持久开关，期望态与缓存不同才动手（避免误反选）。
@@ -266,6 +290,69 @@ class BrowserBackend:
             self._waf_hits.append(body[:200])
         elif "response.created" in body or "choices" in body:
             self._ok_seen = True
+
+    # -- 流式完成观察器（肯定式完成信号，见文件头 STREAM_URL_KEY 注释）------
+
+    def _rec_post_path(self, req) -> None:
+        """记 POST 路径（去 query、去域名），用于诊断流端点改版。回调里不做 IO。"""
+        try:
+            if req.method != "POST":
+                return
+            u = req.url.split("?")[0]
+            if u not in self._post_paths:
+                self._post_paths.append(u)
+                del self._post_paths[:-40]
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _post_paths_tail(self, n: int = 8) -> str:
+        return " | ".join(p.split("//")[-1][:90] for p in self._post_paths[-n:])
+
+    @staticmethod
+    def _is_stream(req) -> bool:
+        try:
+            return req.method == "POST" and STREAM_URL_KEY in req.url
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _on_stream_request(self, req) -> None:
+        if self._is_stream(req):
+            self._stream_reqs.append(time.time())
+
+    def _on_stream_finished(self, req) -> None:
+        if self._is_stream(req):
+            self._stream_done.append(time.time())
+
+    def _stream_reset(self) -> None:
+        self._stream_reqs.clear()
+        self._stream_done.clear()
+
+    def _stream_seen(self, since: float) -> bool:
+        return any(t >= since for t in self._stream_reqs)
+
+    def _stream_finished(self, since: float) -> bool:
+        return any(t >= since for t in self._stream_done)
+
+    @staticmethod
+    def _notice_error(notice: str, where: str) -> RuntimeError:
+        """对话框里的系统提示 → 立刻抛（不再空转到 ASK_TIMEOUT）。
+
+        实测样本（2026-11-27）：`Qwen4-Max 今日已达上限，请升级会员或在上方切换其他
+        模型继续使用。` 渲染在 assistant 气泡里的 `<section class="exceed-limit-error-card">`，
+        **没有 .qwen-markdown**，旧逻辑认为"还没有正文"，一路等到 300s 报"未观测到新文本"
+        —— 把配额耗尽的真因伪装成"页面没反应"。
+        """
+        t = (notice or "").strip()
+        low = t.lower()
+        if any(k in t for k in ("上限", "额度", "升级会员", "积分", "次数", "配额")) \
+                or "quota" in low or "limit" in low:
+            return RuntimeError(f"qwen 额度/次数已用完（quota）：{t}")
+        if any(k in t for k in ("登录", "失效", "过期")) or "login" in low:
+            return RuntimeError(f"qwen 登录态失效（auth）：{t}")
+        if any(k in t for k in ("繁忙", "稍后", "失败", "重试", "网络", "繁忙")) \
+                or "busy" in low or "retry" in low:
+            return RuntimeError(f"qwen 服务端异常（transient）：{t}")
+        return RuntimeError(f"qwen 对话系统提示（{where}）：{t}")
 
     # -- 自检 -----------------------------------------------------
 
@@ -345,6 +432,17 @@ class BrowserBackend:
             # 兜底：直接回首页（等价于新对话）
             self.page.goto(BASE + "/", wait_until="domcontentloaded", timeout=60000)
             self.page.wait_for_timeout(3000)
+        else:
+            # 校验"真的切了"：点了没生效仍留在原对话 → 下一问的读数会被旧回答遮蔽
+            # （deepseek 家 2026-11-26 就是这么假超时的，症状完全一样）。
+            try:
+                self.page.wait_for_function(
+                    "() => document.querySelectorAll('.qwen-chat-message-assistant')"
+                    ".length === 0", timeout=8000)
+            except Exception:  # noqa: BLE001
+                log("⚠️ 新对话未生效（页面仍有历史消息），回首页兜底")
+                self.page.goto(BASE + "/", wait_until="domcontentloaded", timeout=60000)
+                self.page.wait_for_timeout(3000)
         # 新对话 = 页面回默认态：模式/联网归零（页面上模式芯片消失）。
         # ⚠️ 实测：模型选择与思考档**不随新对话重置**（页面级偏好，存 localStorage）。
         self._applied = {**self._applied, "mode": "", "search": None}
@@ -1026,19 +1124,23 @@ class BrowserBackend:
         for p in abs_paths:
             if not Path(p).is_file():
                 raise RuntimeError(f"文件不存在: {p}")
-        chip_sel = SEL_FILE_CHIP + " .vision-item-container"
+        # 芯片选择器：直接数 .file-card-list 的子元素，覆盖所有卡片类型。
+        # ⚠️ 2026-11 实测前端改版：文件卡片类名是 .fileitem-btn，
+        # 旧写法 `+ " .vision-item-container"` 已永远数到 0（上传其实成功，
+        # 却误报「芯片不足」并拒绝发送）。别再写死具体卡片类名。
+        chip_sel = SEL_FILE_CHIP + " > *"
         before = self.page.locator(chip_sel).count()
         done = False
         try:
             with self.page.expect_file_chooser(timeout=15000) as fc:
                 self._plus_open()
-                self.page.evaluate(
-                    """(want) => {
-                       for (const e of document.querySelectorAll('.qwen-chat-v2-dropdown-menu-item')) {
-                         const t = (e.innerText || '').trim();
-                         if (t && (t === want || t.startsWith(want))) { e.click(); return; }
-                       }
-                     }""", PLUS_MODES["upload"])
+                # ⚠️ 不能 JS 盲点：浮层是异步渲染的，evaluate 里 querySelector
+                # 可能一上来就查不到（拿到 0 个 → 什么都不点 → filechooser 超时）。
+                # 用 Playwright locator 等可见再真实点击，稳得多。
+                item = self.page.locator(
+                    ".qwen-chat-v2-dropdown-menu-item", has_text=PLUS_MODES["upload"]).first
+                item.wait_for(state="visible", timeout=10000)
+                item.click()
             fc.value.set_files(abs_paths)
             done = True
         except Exception as e:  # noqa: BLE001
@@ -1051,15 +1153,45 @@ class BrowserBackend:
                 done = True
             except Exception:  # noqa: BLE001
                 pass
+        # ⚠️ 芯片出现 ≠ 附件可用（2026-11 实测）：
+        #   文档类附件（txt/docx/pdf…）选中后卡片**立刻**出现，但还要走
+        #   /api/v2/files/parse 解析（实测 2~4s，大文件更久），期间卡片文字是
+        #   「解析中……」。此时发送会被前端挡下 —— 表现为消息没进对话、
+        #   ask 侧「等待回答超时」，随后卡片转红「解析失败」。
+        #   旧代码数的 .vision-item-container 只在解析完成后才渲染，等价于
+        #   隐式等解析；改版后卡片提前出现，这层等待必须显式补回来。
+        #   图片/视频不走 parse，pending 恒为 0，不受影响。
+        want = before + len(abs_paths)
         deadline = time.time() + 120
+        st = {"n": 0, "pending": 0, "failed": 0}
         while time.time() < deadline:
             self.page.wait_for_timeout(800)
-            if self.page.locator(chip_sel).count() >= before + len(abs_paths):
+            st = self.page.evaluate(
+                """(sel) => {
+                  const list = document.querySelector(sel);
+                  if (!list) return {n: 0, pending: 0, failed: 0};
+                  const cards = [...list.children];
+                  let pending = 0, failed = 0;
+                  for (const c of cards) {
+                    const t = c.innerText || '';
+                    if (t.includes('解析中') || t.includes('上传中')) pending++;
+                    else if (t.includes('解析失败') || t.includes('上传失败')) failed++;
+                  }
+                  return {n: cards.length, pending: pending, failed: failed};
+                }""", SEL_FILE_CHIP)
+            if st["n"] >= want and not st["pending"]:
                 break
-        else:
+        if st["n"] < want:
             raise RuntimeError(
-                f"上传芯片不足：期望 {before + len(abs_paths)} 个，"
-                f"实际 {self.page.locator(chip_sel).count()} 个（route={'fc' if done else 'none'}）")
+                f"上传芯片不足：期望 {want} 个，实际 {st['n']} 个"
+                f"（route={'fc' if done else 'none'}）")
+        if st["failed"]:
+            raise RuntimeError(
+                f"附件解析失败 {st['failed']} 个（服务端 /files/parse 未就绪）")
+        if st["pending"]:
+            raise RuntimeError(
+                f"附件解析超时：仍有 {st['pending']} 个停在「解析中」")
+        # 解析刚完成时前端还要把文本挂到消息体上，留一点余量再发送
         self.page.wait_for_timeout(1500)
         log(f"attached {len(abs_paths)} file(s)")
         return len(abs_paths)
@@ -1072,7 +1204,12 @@ class BrowserBackend:
             """() => {
               const boxes = document.querySelectorAll('.qwen-chat-message-assistant');
               const last = boxes.length ? boxes[boxes.length - 1] : null;
-              if (!last) return {answer: '', thinking: '', refs: [], images: [], videos: [], loading: false, present: false};
+              if (!last) {
+                const c = document.querySelector('.exceed-limit-error-card');
+                return {answer: '', thinking: '', refs: [], images: [], videos: [],
+                        files: [], attachments: [], loading: false, present: false,
+                        notice: c ? (c.innerText || '').trim() : ''};
+              }
               const md = last.querySelector('.qwen-markdown');
               let answer = md ? (md.innerText || '').trim() : '';
               // web_dev 类产物：正文在 iframe 预览里，HTML 源码在 srcdoc（2026-10-19 实测：
@@ -1139,6 +1276,36 @@ class BrowserBackend:
                   preview: !!c.querySelector('[class*=attachment-card-botton]'),
                 });
               });
+              // 系统提示/错误卡（额度耗尽 `.exceed-limit-error-card`、繁忙、登录失效）：
+              // 这类消息**没有 .qwen-markdown 正文**，旧逻辑当成"还没出文本"→空转到超时。
+              let notice = '';
+              const card = last.querySelector('.exceed-limit-error-card');
+              if (card) notice = (card.innerText || '').trim();
+              if (!notice) {
+                for (const el of last.querySelectorAll(
+                      '[class*=error], [class*=limit], [class*=notice]')) {
+                  const t = (el.innerText || '').trim();
+                  if (t && t.length < 240) { notice = t; break; }
+                }
+              }
+              if (!notice && !answer) {
+                // 兜底：末条既无正文也无错误卡类名 —— 只有命中关键词的短文案才当真
+                const t = (last.innerText || '').trim();
+                if (t && t.length < 240
+                    && /上限|额度|升级会员|频繁|繁忙|登录|失效|过期|网络|连接|断开|异常|错误|quota|limit/i.test(t)) notice = t;
+              }
+              if (!notice && !answer) {
+                // 文档级扫描：`网络错误，重新连接中...` 这类 toast/横幅挂在 body 上，
+                // **不在 assistant 气泡里** → 只看 last 会漏检，然后干等到超时
+                // （2026-11-27 实测：SSE 断流时页面只剩这句浮层，被误报成"无正文疑似被拒"）。
+                const kw = /上限|额度|升级会员|频繁|繁忙|登录|失效|过期|网络|连接|断开|异常|错误|quota|limit/i;
+                for (const el of document.querySelectorAll(
+                      '[class*=error], [class*=Error], [class*=toast], [class*=alert],'
+                      + '[role=alert], [class*=notice], [class*=retry]')) {
+                  const t = (el.innerText || '').trim();
+                  if (t && t.length < 240 && kw.test(t)) { notice = t; break; }
+                }
+              }
               return {
                 answer: answer,
                 thinking: thinking,
@@ -1149,9 +1316,51 @@ class BrowserBackend:
                 attachments: attachments,
                 loading: !!last.querySelector('.response-loading'),
                 present: true,
+                notice: notice,
               };
             }"""
         )
+
+    # -- 无正文时的现场取证 ----------------------------------------
+
+    def _diagnose_no_text(self, notice: str = "") -> str:
+        """「流已结束但页面没有正文」时抓现场：截图 + 节点计数 + 可见短文案。
+
+        2026-11-27 首次遇到这个分支时只报了一句"无系统提示"，事后无从定位到底是
+        额度、风控还是前端弹层 —— 证据必须留在错误信息里，不能靠重跑复现。
+        """
+        SHOTS.mkdir(exist_ok=True)
+        p = SHOTS / f"notext_{int(time.time())}.png"
+        try:
+            self.page.screenshot(path=str(p))
+        except Exception:  # noqa: BLE001
+            p = None
+        try:
+            diag = self.page.evaluate(
+                """() => {
+                  const body = (document.body.innerText || '').replace(/\\n{2,}/g, '\\n');
+                  const cards = [...document.querySelectorAll(
+                      '.exceed-limit-error-card, [class*=limit], [class*=error],'
+                      + '[class*=toast], [role=dialog], [class*=modal]')]
+                    .map(e => (e.innerText || '').trim())
+                    .filter(t => t && t.length < 200);
+                  return {
+                    assistants: document.querySelectorAll('.qwen-chat-message-assistant').length,
+                    last_text: (() => {
+                      const b = document.querySelectorAll('.qwen-chat-message-assistant');
+                      return b.length ? (b[b.length - 1].innerText || '').trim().slice(0, 300) : '';
+                    })(),
+                    loading: !!document.querySelector('.response-loading'),
+                    cards: cards.slice(0, 4),
+                    body_tail: body.slice(-400),
+                  };
+                }"""
+            )
+        except Exception as e:  # noqa: BLE001
+            diag = {"err": str(e)[:200]}
+        return (f"notice={notice[:120]!r}; 截图={p}; "
+                f"POST端点={self._post_paths_tail()}; "
+                f"现场={json.dumps(diag, ensure_ascii=False)[:700]}")
 
     # -- 产物读取（不发送消息）-------------------------------------
 
@@ -1241,12 +1450,19 @@ class BrowserBackend:
         else:
             box.press_sequentially(text, delay=random.randint(18, 45))
         self.page.wait_for_timeout(random.randint(400, 900))
+        self._stream_reset()            # 必须在按下 Enter 前清空，才能只数本次的流
+        # ⚠️ send_ts 必须在 press 之前取：press 同步派发 keydown，请求可能紧接着就发出；
+        # 若在其后取时间戳，请求时刻会早于 send_ts，`_stream_seen()` 的 `t >= since`
+        # 永不成立（2026-11-27 实测：端点明明命中却报「流事件=N」）。
+        send_ts = time.time()
         box.press("Enter")
         log(f"sent len={len(text)}")
 
-        # 完成判定：把「正文 + 产物(图/视频/文件)」合成一个签名，签名稳定且无 loading
-        # 才算完。只盯正文的话，t2i/t2v/slides 这类**没有正文只有产物**的模式会
-        # 一路空转到超时（实测 t2i 因此白等 420s）。
+        # ── 完成判定（2026-11-27 重做 = 反思58 的根治）──────────────────
+        # 签名 = 「正文 + 产物(图/视频/文件)」：t2i/t2v/slides 这类**没有正文只有产物**
+        # 的模式只盯正文会一路空转到超时（实测 t2i 因此白等 420s）。
+        # 结束条件 = SSE 流结束（肯定式信号）+ DOM 再稳 SETTLE_POLLS 轮 + 页面不自认在生成。
+        # 只有观测不到流事件（页面改版）才退回稳定窗口兜底，且窗口比旧 3 轮保守得多。
         def _sig(st: dict) -> str:
             ans = (st.get("answer") or "").strip()
             assets = (st.get("images") or []) + (st.get("videos") or []) + (st.get("files") or [])
@@ -1261,16 +1477,40 @@ class BrowserBackend:
             if polls % 2 == 0:            # 每隔一轮查一次风控（人机验证立刻停手）
                 self.guard("ask:poll")
             cur_st = self._read(self.page)
-            n = self.page.evaluate("() => document.querySelectorAll('.qwen-chat-message-assistant').length")
+            notice = (cur_st.get("notice") or "").strip()
             sig = _sig(cur_st)
+            if notice and not sig.strip("|"):
+                raise self._notice_error(notice, "ask:poll")   # 额度/繁忙/登录 → 立刻抛
+            n = self.page.evaluate(
+                "() => document.querySelectorAll('.qwen-chat-message-assistant').length")
             fresh = cur_st.get("present") and (n > prev_n or sig != prev_sig)
-            if fresh and sig.strip("|") and sig == last_sig and not cur_st.get("loading"):
-                stable += 1
-                if stable >= STABLE_POLLS:
+            if not (fresh and sig.strip("|")):
+                # 还没有新正文/产物。若服务端已经结束 → 被拒/页面异常，别白等满 timeout。
+                # ⚠️ 必须给渲染留余地：markdown 渲染/大代码块落 DOM 有滞后（实测长回答
+                # 2~5s），只等 3 轮就判死会把"正在渲染"错杀成"被拒"。故再要求超过
+                # STREAM_PROBE_SEC；判定前先抓现场（截图+DOM 摘要）再抛。
+                if (self._stream_finished(send_ts) and polls >= 3
+                        and time.time() - send_ts > STREAM_PROBE_SEC):
+                    raise RuntimeError(
+                        "qwen 服务端已结束但页面没有正文/产物（疑似被拒/额度/页面异常）: "
+                        + self._diagnose_no_text(notice))
+                stable, last_sig = 0, sig
+                continue
+            if sig != last_sig:
+                stable, last_sig = 0, sig
+                continue
+            stable += 1
+            if cur_st.get("loading"):
+                continue                  # 页面自己还认为在生成，宁可信它
+            if self._stream_finished(send_ts):
+                if stable >= SETTLE_POLLS:
                     break
-            else:
-                stable = 0
-                last_sig = sig
+            elif (not self._stream_seen(send_ts)
+                  and time.time() - send_ts > STREAM_PROBE_SEC
+                  and stable >= FALLBACK_STABLE_POLLS):
+                log("⚠️ 未观测到 completions 流事件，退回稳定窗口兜底；"
+                    f"POST端点={self._post_paths_tail()}")
+                break
 
         if think:
             self._expand_thinking()
@@ -1287,6 +1527,9 @@ class BrowserBackend:
                 final = self._read(self.page)
         answer = (final.get("answer") or "").strip()
         elapsed = round(time.time() - t0, 1)
+        # 每次成功都留一行端点快照：流端点改版时，上一行日志就能给出真端点
+        log(f"done len={len(answer)} 流事件={'Y' if self._stream_seen(send_ts) else 'N'} "
+            f"POST端点={self._post_paths_tail(5)}")
 
         if not answer and not (final.get("images") or final.get("videos")
                                 or final.get("files") or final.get("attachments")):

@@ -4,3 +4,5 @@ state.json
 qwen_backend.sock
 xvfb.pid
 shots/
+# 浏览器 profile（含登录 cookie = 凭据，绝不入库）
+profile/

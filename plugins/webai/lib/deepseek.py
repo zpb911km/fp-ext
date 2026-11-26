@@ -257,6 +257,9 @@ def classify(text: str = "", status: int = 0, raw=None, exc=None, **_):
     low = blob.lower()
     if "rate_limit" in low or "frequent" in low or "节奏保护" in blob or "配额" in blob:
         return "quota"
+    # 页面系统提示（额度耗尽/需登录等）也可能是中文短文案，按关键词兜住
+    if any(k in blob for k in ("上限", "额度", "升级会员", "积分", "次数已达")):
+        return "quota"
     if "登录态缺失" in blob or "login" in low and "profile" in low:
         return "auth"
     return ""
