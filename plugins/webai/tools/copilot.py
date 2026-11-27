@@ -57,6 +57,24 @@ def _get_provider(name: str):
     return p
 
 
+def _provider_default_model(p: Any) -> str:
+    """用户未指定模型时的 provider 默认模型：**账号级 pin 为权威**。
+
+    模块级 ``default_model`` 是 pin 的**静态镜像**：用户改了 pin（后端 ``pin_model``
+    或网页上操作）后，本进程的旧值会一直留着——provider 模块每进程只 import 一次
+    并缓存（lib._cache）。浏览器通道后端能向 daemon 查实时 pin（「取消默认」标记
+    条目），故以它为权威；非浏览器通道 / daemon 未起 / 读失败 → 返回 ""，
+    由调用方回落模块常量。
+    """
+    try:
+        for m in p.models() or []:
+            if "取消默认" in (m.get("pin_action") or ""):
+                return m.get("name") or ""
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 # ── 错误友好化 ──────────────────────────────────────────────────
 # 裸异常（HTTP 401 / "Messages too frequent" / 内容策略拒绝 …）对用户没有意义，
 # 归类后翻成"下一步该做什么"。归类走 webai.classify（provider 方言优先，认不出
@@ -259,7 +277,10 @@ def copilot_say(
             ),
         }
 
-    model = want_model or rec_model or getattr(p, "default_model", "")
+    # 默认模型三级取：显式 > 会话已绑定 > 账号级 pin（实时查）> 模块常量（静态镜像）。
+    # pin 权威化是为了堵住「常量过期」：进程内模块只加载一次，用户改 pin 后常量不更新，
+    # 而 copilot 会话会把默认值绑死到每个后续 ask（绕过后端对齐）。
+    model = want_model or rec_model or _provider_default_model(p) or getattr(p, "default_model", "")
 
     # ── 新建 or 复用 ──
     if not rec.get("chat_id"):
@@ -379,7 +400,8 @@ def copilot_new(session: str, role: str = "", model: str = "", provider: str = "
     except Exception as e:  # noqa: BLE001
         return {"success": False, "error": _explain_unavailable(prov, str(e))}
 
-    model = model or getattr(p, "default_model", "")
+    # 与 say() 建会话路径同规则：显式 > 账号级 pin（实时查）> 模块常量（静态镜像会过期）
+    model = model or _provider_default_model(p) or getattr(p, "default_model", "")
     try:
         chat_id = p.new_session(model)
     except Exception as e:  # noqa: BLE001

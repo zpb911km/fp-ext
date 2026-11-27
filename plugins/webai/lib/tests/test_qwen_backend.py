@@ -358,12 +358,98 @@ def test_video_params_and_semantics(webai):
     chk("VIP" in pr["video_params"]["note"], "video_params 的 note 写明 VIP 档限制")
 
 
+# ── §8 新对话 pin 对齐 ────────────────────────────────────────
+
+
+def test_new_chat_pin_alignment(webai):
+    """§8 新对话 pin 对齐（离线静态检查 + 契约）。
+
+    背景（2026-11-27 实测）：新对话的初始模型在页面侧**不确定**——``new_chat()``
+    两条路径（点按钮 / goto 首页）+ 左上角下拉是页面级偏好（localStorage），只在
+    整页加载时吃到账号 pin。账号 pin 在 3.7-Plus 时，10 分钟内三个新建对话出现两
+    种结果（一个落到 4-Max）；而 4-Max 当时恰好无额度 → 报 quota 错，报错文案又
+    把原因伪装成「后端坏了」。
+    修法：``--new-chat`` 且无 ``--model`` 时，``_align_to_pinned_default()`` 在发送
+    前把下拉强制对齐到 pin（「取消默认」标记项）。账号**有** pin 时对齐是强制的：
+    重试读清单（新对话后下拉渲染有延迟）+ 重试设置，仍失败直接抛错——绝不静默
+    沿用不可控默认（静默 = 随机 quota 陷阱）。账号**无** pin 时不碰页面。
+    显式 model 永远优先；追问（非新对话）不碰（保持会话内模型连续）。
+    """
+    print("== §8 新对话 pin 对齐（离线静态检查）==")
+    q = webai.get("qwen")
+    src = q.BACKEND.read_text(encoding="utf-8")
+    compile(src, str(q.BACKEND), "exec")
+
+    chk("def _align_to_pinned_default" in src, "后端有 _align_to_pinned_default 对齐驱动")
+    # ask 流程接线：显式 model 分支在前，对齐只出现在无显式模型的 new-chat 分支
+    i_ask = src.index("def ask(")
+    i_explicit = src.index("if model:", i_ask)
+    i_align = src.find("self._align_to_pinned_default()", i_ask)
+    chk(0 < i_explicit < i_align,
+        "对齐只在「无显式模型」分支发生（显式 --model 永远优先）")
+    chk("elif new_chat:" in src[i_explicit:i_align],
+        "对齐只触发于新对话（追问保持会话内模型连续）")
+    # 对齐实现细节
+    i_def = src.index("def _align_to_pinned_default")
+    body = src[i_def:src.index("\n    def ", i_def)]
+    chk('"取消默认"' in body and "pin_action" in body,
+        "pin 项按 pin_action 含「取消默认」识别，不按 selected（selected 是对话在用模型）")
+    chk("list_models(force=True)" in body,
+        "对齐时重读模型清单（不用缓存——pin 状态可能刚刚才改过）")
+    chk('if items:\n                return  # 清单可读且账号没有 pin',
+        "账号无 pin 时不碰页面（清单可读但无「取消默认」→ 跟账号默认走）")
+    chk("清单为空" in body and "raise RuntimeError" in body,
+        "有 pin 但对齐失败 → 直接抛错，不静默沿用不可控默认（静默=随机 quota 陷阱）")
+    chk("new-chat model aligned" in body, "对齐成功后留 daemon 日志痕迹")
+    chk("for attempt in range(5)" in body, "读清单有重试（新对话后下拉渲染有延迟）")
+
+
+# ── §9 copilot 会话绑定跟随账号 pin ────────────────────────────
+
+
+def test_copilot_pin_binding(webai):
+    """§9 copilot 建会话的默认模型：账号级 pin 为权威（离线静态检查）。
+
+    背景（2026-11-27 实测）：copilot 会话的模型在建会话时绑定，其后每个 ask 都显式
+    带着传（绕过后端对齐）。旧绑定源是模块级 ``default_model``——pin 的**静态镜像**。
+    provider 模块每进程只 import 一次并缓存（lib._cache），用户改 pin 后运行进程的
+    常量不变 → 新会话绑到无额度的模型，quota 错被伪装成「后端坏了」。
+    修法：① ``qwen.models()`` 透传 daemon 的 ``pin_action``（「取消默认」= pin 项）；
+    ② copilot 两条建会话路径（say 内隐式新建 / action=new）优先取实时 pin，回落常量。
+    """
+    print("== §9 copilot 会话绑定跟随账号 pin（离线静态检查）==")
+    # ① qwen.models() 必须透传 pin_action —— 不透传则 copilot 层根本看不到 pin
+    qsrc_p = os.path.join(PKG, "qwen.py")
+    qsrc = open(qsrc_p, encoding="utf-8").read()
+    compile(qsrc, qsrc_p, "exec")
+    i_m = qsrc.index("def models(")
+    body = qsrc[i_m:qsrc.index("\ndef ", i_m + 10)]
+    chk('"pin_action"' in body and "m.get(\"pin_action\")" in body,
+        "qwen.models() 透传 pin_action（「取消默认」= 账号 pin 项）")
+    # ② copilot 绑定以实时 pin 为优先
+    csrc_p = os.path.join(PKG, "..", "tools", "copilot.py")
+    csrc = open(os.path.normpath(csrc_p), encoding="utf-8").read()
+    compile(csrc, csrc_p, "exec")
+    chk("def _provider_default_model" in csrc,
+        "copilot 有 _provider_default_model（默认模型以账号 pin 为权威）")
+    chk(csrc.count("_provider_default_model(p)") >= 2,
+        "say 建会话路径与 copilot_new 路径都查实时 pin（两个绑定处）")
+    i_h = csrc.index("def _provider_default_model")
+    hbody = csrc[i_h:csrc.index("\ndef ", i_h + 10)]
+    chk('"取消默认"' in hbody and "p.models()" in hbody,
+        "pin 查询走 provider.models()，按「取消默认」标记条目识别")
+    chk("except Exception" in hbody and 'return ""' in hbody,
+        "查询失败（daemon 未起 / 非浏览器通道）回落模块常量，不阻塞建会话")
+
+
 # ── runner ────────────────────────────────────────────────────
 
 
 TESTS = [test_ask_contract, test_error_funnel, test_upload_deferred,
          test_capability_honesty, test_backend_dom_drivers,
-         test_video_params_and_semantics]
+         test_video_params_and_semantics,
+         test_new_chat_pin_alignment,
+         test_copilot_pin_binding]
 
 
 def main():

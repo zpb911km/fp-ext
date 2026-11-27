@@ -35,9 +35,10 @@ capabilities = {"chat", "search", "vision", "attach"}
 # backend.py pin 做过账号级「设为默认」，故新开页面左上角即 Qwen4-Max）。
 # ⚠️ 2026-11-27 实测：账号当日免费额度**整体**耗尽（Qwen4-Max / Qwen3.8-Max 都回
 # 「今日已达上限」），这是配额事实、不是代码缺陷 —— 后端已改成 8~21s 内报 quota
-# （旧实现空转 300s 报"未观测到新文本"，把配额伪装成后端坏了）。故这里仍如实记录
-# 页面实际默认模型，不因临时配额去改用户的模型偏好。
-default_model = "Qwen4-Max"
+# （旧实现空转 300s 报"未观测到新文本"，把配额伪装成后端坏了）。
+# 2026-11-27 应用户要求 pin 改为 Qwen3.7-Plus（额度够用）：qwen.pin_model() 已做完
+# 账号级 pin，此处如实记录页面实际默认模型。
+default_model = "Qwen3.7-Plus"
 # 能力名 → 方言：浏览器通道的方言是加号菜单条目（backend PLUS_MODES 翻译）。
 # 对齐旧 API 通道：t2i/t2v/slides/web_dev/deep_research ↔ chat_type。
 CAPABILITY_MAP = {
@@ -306,7 +307,7 @@ def upload(path: str) -> dict:
 def models(force: bool = False) -> list:
     """模型清单：从页面左上角下拉**真实读取**（一级 3 个 + 「展开更多模型」二级 4 个）。
 
-    异常/读不到 → []（诚实）。返回 [{"id","name","capabilities","ctx","default","tier"}]。
+    异常/读不到 → []（诚实）。返回 [{"id","name","capabilities","ctx","default","tier","pin_action"}]。
     ⚠️ 会拉起浏览器会话（daemon 不在就冷启动），调用方注意成本。
     """
     try:
@@ -318,7 +319,10 @@ def models(force: bool = False) -> list:
     return [{"id": m.get("name", ""), "name": m.get("name", ""),
              "capabilities": set(m.get("capabilities") or []),
              "ctx": int(m.get("ctx") or 0), "default": bool(m.get("default")),
-             "desc": m.get("desc", ""), "tier": int(m.get("tier") or 1)}
+             "desc": m.get("desc", ""), "tier": int(m.get("tier") or 1),
+             # 「取消默认」= 该账号 pin 住的默认模型（tools/copilot.py 建会话时按它绑定，
+             # 见其 _provider_default_model；模块级 default_model 只是静态镜像，会过期）
+             "pin_action": m.get("pin_action") or ""}
             for m in res.get("models") or [] if m.get("name")]
 
 

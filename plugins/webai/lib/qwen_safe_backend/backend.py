@@ -702,6 +702,55 @@ class BrowserBackend:
         log(f"default model pinned -> {got}")
         return got
 
+    def _align_to_pinned_default(self) -> None:
+        """新对话未显式指定模型时：把页面左上角下拉强制对齐到账号级 pin（「取消默认」标记项）。
+
+        2026-11-27 实测页面行为：新对话的初始模型**不确定**——``new_chat()`` 有两条
+        路径（点「新对话」按钮 / goto 回首页），左上角下拉是页面级偏好（localStorage，
+        见 new_chat 注释），只在整页加载时才吃到账号 pin。10 分钟内三个新建对话两种
+        结果（一个 4-Max、两个 3.7-Plus）；当时 4-Max 恰好无额度 → 不强制对齐的话，
+        新对话提问会随机死于 quota，且报错看起来像「后端坏了」。
+
+        set_model 是已验证可靠的「要哪个模型就给哪个」手段（点→复读复核，不会假成功），
+        故发送前用它对齐。注意这**不是** best-effort：账号一旦有 pin，对齐是强制的——
+        静默沿用不可控的页面默认等于把用户送回随机 quota 的陷阱。仅当清单读成功但
+        账号确实无 pin（没有「取消默认」条目）时，才不碰页面、跟账号默认走。
+        """
+        # 新对话刚落地，下拉/菜单可能还没渲染：重试读到非空为止
+        items, last_err = [], ""
+        for attempt in range(5):
+            try:
+                items = self.list_models(force=True)
+                if items:
+                    break
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+            log(f"⚠️ align-pin: 模型清单未就绪 #{attempt + 1}")
+            self._jitter(1200, 2200)
+        pinned = next((it for it in items
+                       if "取消默认" in (it.get("pin_action") or "")), None)
+        if not pinned:
+            if items:
+                return  # 清单可读且账号没有 pin → 跟页面(账号默认)走
+            raise RuntimeError(
+                "新对话对齐失败：反复读取模型下拉清单为空"
+                f"（页面未就绪或选择器变更）{('；' + last_err[:80]) if last_err else ''}")
+        want = pinned["name"]
+        if self._norm(want) == self._norm(self.current_model() or ""):
+            return  # 页面已在 pin 上 → 不动
+        last_err = ""
+        for attempt in range(3):
+            try:
+                self.set_model(want)
+                log(f"new-chat model aligned -> {want}")
+                return
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                log(f"⚠️ align-pin: 第 {attempt + 1} 次尝试失败 {e}")
+                self._jitter(800, 1600)
+        raise RuntimeError(
+            f"新对话模型对齐失败（账号 pin={want!r}，页面当前={self.current_model()!r}）: {last_err}")
+
     def set_thinking(self, want: str) -> str:
         """驱动输入区「自动/思考/快速」下拉。want: auto|thinking|fast 或中文档名。"""
         key = _THINK_ALIAS.get((want or "").lower(), (want or "").lower())
@@ -1405,6 +1454,12 @@ class BrowserBackend:
             if want_mode and self.current_mode() != PLUS_MODES.get(want_mode, want_mode):
                 log("⚠️ 切模型后模式丢失，重设")
                 self.set_mode(want_mode)
+        elif new_chat:
+            # 新对话的初始模型在页面侧不确定（2026-11-27 实测：账号 pin 在 3.7-Plus，
+            # 新建对话却时而是 4-Max、时而是 3.7-Plus，10 分钟内三个对话两种结果）。
+            # 对齐到账号级 pin 保证确定性；账号有 pin 时强制（对齐失败直接报错，
+            # 不静默沿用不可控默认——那等于把用户送回随机 quota 的陷阱）。
+            self._align_to_pinned_default()
         # 思考档：True→思考；str→按档名；False→自动（当前代码语义：显式归位）
         if think is True:
             self.set_thinking("thinking")
